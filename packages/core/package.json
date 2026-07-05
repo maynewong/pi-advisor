@@ -1,0 +1,29 @@
+{
+	"name": "pi-subagent-core",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"files": [
+		"src",
+		"README.md",
+		"docs/design.md"
+	],
+	"scripts": {
+		"test": "vitest --run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "0.80.2",
+		"@earendil-works/pi-ai": "0.80.2",
+		"@earendil-works/pi-coding-agent": "0.80.2",
+		"minimatch": "10.2.5",
+		"typebox": "1.1.38",
+		"yaml": "2.9.0"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
