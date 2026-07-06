@@ -5,7 +5,7 @@
 import { fileURLToPath } from "node:url";
 import { loadProfileFile, type SubagentProfile } from "pi-subagent-core";
 
-export const builtInAgentNames = ["oracle", "worker", "scout", "reviewer"] as const;
+export const builtInAgentNames = ["oracle", "oracle-plan", "worker", "scout", "reviewer"] as const;
 export type BuiltInAgentName = typeof builtInAgentNames[number];
 
 /** Return the installed markdown path for a bundled role card. */

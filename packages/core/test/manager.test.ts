@@ -166,6 +166,15 @@ describe("SubagentManager", () => {
 		await expect(manager.spawn(PROFILE, "fail").wait()).resolves.toMatchObject({ status: "failed", error: { kind: "model", message: "model unavailable" } });
 	});
 
+	test("fails fast when an oracle override adds a dangerous tool", () => {
+		const manager = new SubagentManager({ cwd: "/repo", createDriver: async () => ({ run: async () => ({ text: "ok" }), async abort() {} }) });
+		const oracle = { ...PROFILE, name: "oracle" };
+
+		expect(() => manager.spawn(oracle, "review", { overrides: { tools: ["read", "write"] } })).toThrow(/read-only.*write/i);
+		expect(() => manager.spawn(oracle, "review", { overrides: { name: "worker", tools: ["read", "bash"] } })).toThrow(/read-only.*bash/i);
+		expect(() => manager.spawn({ ...oracle, name: "oracle-plan" }, "review", { overrides: { tools: ["read", "edit"] } })).toThrow(/read-only.*edit/i);
+	});
+
 	test("runs in a provisioned workspace and cleans it according to policy", async () => {
 		const cleanup = vi.fn(async () => {});
 		const prepare = vi.fn(async (id: string) => ({ cwd: `/isolated/${id}`, cleanup }));

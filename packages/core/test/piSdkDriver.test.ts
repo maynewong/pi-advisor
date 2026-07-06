@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, test } from "vitest";
 import {
+	assertOracleReadOnly,
 	driverErrorFromMessages,
 	resolveActiveTools,
 	successfulFileEvent,
@@ -40,6 +41,18 @@ describe("piSdkDriver projections", () => {
 
 		expect(resolveActiveTools(explicit)).toEqual(["read", "submit_result"]);
 		expect(resolveActiveTools(defaults)).toEqual(["read", "bash", "edit", "write", "submit_result"]);
+	});
+
+	test("rejects oracle profiles that expose mutating tools or SDK defaults", () => {
+		const safe: SubagentProfile = { name: "oracle", description: "reasons", systemPrompt: "analyze", tools: ["read", "grep"] };
+		const unsafe: SubagentProfile = { ...safe, tools: ["read", "bash"] };
+		const unsafePlan: SubagentProfile = { ...safe, name: "oracle-plan", tools: ["read", "write"] };
+		const implicitDefaults: SubagentProfile = { name: "oracle", description: "reasons", systemPrompt: "analyze" };
+
+		expect(() => assertOracleReadOnly(safe)).not.toThrow();
+		expect(() => assertOracleReadOnly(unsafe)).toThrow(/read-only.*bash/i);
+		expect(() => assertOracleReadOnly(unsafePlan)).toThrow(/read-only.*write/i);
+		expect(() => assertOracleReadOnly(implicitDefaults)).toThrow(/explicit tool allowlist/i);
 	});
 
 	test("reports file access only after successful tool completion", () => {

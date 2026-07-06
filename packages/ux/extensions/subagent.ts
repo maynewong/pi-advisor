@@ -5,13 +5,17 @@
  * widget, a compact renderCall line, and a renderResult view that shows
  * milestones/activity while running and a full markdown report when done.
  */
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	SubagentManager,
 	loadProfileFile,
+	type ContextInput,
+	type ModelSpec,
 	type SubagentEvent,
 	type SubagentHandle,
 	type SubagentProfile,
@@ -28,7 +32,138 @@ const parameters = Type.Object({
 	files: Type.Optional(Type.Array(Type.String(), {
 		description: "Optional files to inject into the subagent context packet",
 	})),
+	includeDiff: Type.Optional(Type.Boolean({
+		description: "Inject the current git working tree diff into the subagent context packet",
+	})),
 });
+
+const STRONG_REASONING_ALIAS = "strong-reasoning";
+const MODEL_CONFIG_FILE = "subagent-kit.json";
+const ORACLE_GUIDANCE = `Consider consulting the oracle subagent (read-only second opinion) before editing when:
+- the change touches auth, billing, permissions, data migration, or a public API contract;
+- tests are failing and the root cause is not yet confirmed;
+- you are choosing between architectural approaches;
+- your own confidence in the plan is low.
+Always tell the user you are consulting oracle and why. Never use oracle for typo fixes, renames, small clearly-scoped bugs, or file search (use scout for search).`;
+
+const ORACLE_VERDICTS = new Set(["safe_to_proceed", "proceed_with_changes", "blocked", "need_more_information"]);
+const ORACLE_CONFIDENCE = new Set(["low", "medium", "high"]);
+
+export interface SubagentUserConfig {
+	agents: Record<string, { model?: string }>;
+}
+
+export interface OracleReportView {
+	verdict: string;
+	confidence: string;
+	reportMarkdown: string;
+}
+
+function isMissingFile(error: unknown): boolean {
+	return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+/** Load user-scoped agent overrides without reading project configuration or provider credentials. */
+export async function loadSubagentConfig(agentDir = getAgentDir()): Promise<SubagentUserConfig> {
+	const path = join(agentDir, MODEL_CONFIG_FILE);
+	let raw: string;
+	try {
+		raw = await readFile(path, "utf8");
+	} catch (error) {
+		if (isMissingFile(error)) return { agents: {} };
+		throw error;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new Error(`Invalid ${path}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`Invalid ${path}: expected an object`);
+	const agents = (parsed as Record<string, unknown>).agents;
+	if (agents === undefined) return { agents: {} };
+	if (!agents || typeof agents !== "object" || Array.isArray(agents)) throw new Error(`Invalid ${path}: agents must be an object`);
+	for (const [name, settings] of Object.entries(agents)) {
+		if (!name.trim() || !settings || typeof settings !== "object" || Array.isArray(settings)) {
+			throw new Error(`Invalid ${path}: agents entries must be named objects`);
+		}
+		const model = (settings as Record<string, unknown>).model;
+		if (model !== undefined && (typeof model !== "string" || !model.trim())) {
+			throw new Error(`Invalid ${path}: agents.${name}.model must be a non-empty string`);
+		}
+	}
+	return { agents: agents as SubagentUserConfig["agents"] };
+}
+
+/** Append the parent-facing consultation policy once per assembled prompt. */
+export function appendOracleGuidance(systemPrompt: string): string {
+	return systemPrompt.includes(ORACLE_GUIDANCE) ? systemPrompt : `${systemPrompt}\n\n${ORACLE_GUIDANCE}`;
+}
+
+/** Build a parent-agent request that invokes Oracle with the current working-tree diff. */
+export function oracleCommandPrompt(question: string): string | undefined {
+	const task = question.trim();
+	if (!task) return undefined;
+	return `Call the subagent tool with exactly these inputs:\n- agent: "oracle"\n- task: ${JSON.stringify(task)}\n- includeDiff: true\nTell me you are consulting Oracle before the tool call, then summarize its verdict.`;
+}
+
+/** Project validated Oracle schema output into fields consumed by the result renderer. */
+export function oracleReportFromOutput(output: unknown): OracleReportView | undefined {
+	if (!output || typeof output !== "object" || Array.isArray(output)) return undefined;
+	const report = output as Record<string, unknown>;
+	if (typeof report.verdict !== "string" || !ORACLE_VERDICTS.has(report.verdict)) return undefined;
+	if (typeof report.confidence !== "string" || !ORACLE_CONFIDENCE.has(report.confidence)) return undefined;
+	if (typeof report.report_markdown !== "string") return undefined;
+	return { verdict: report.verdict, confidence: report.confidence, reportMarkdown: report.report_markdown };
+}
+
+/** Build only the caller-selected context, using execFile-backed git diff handling in core. */
+export function contextForSubagent(
+	files: string[] | undefined,
+	includeDiff: boolean | undefined,
+	forkFrom?: NonNullable<ContextInput["forkFrom"]>,
+): ContextInput | undefined {
+	if (!files?.length && !includeDiff && !forkFrom) return undefined;
+	return {
+		...(files?.length ? { files } : {}),
+		...(includeDiff ? { diff: { base: "HEAD" } } : {}),
+		...(forkFrom ? { forkFrom } : {}),
+	};
+}
+
+type ExtensionModel = NonNullable<ExtensionContext["model"]>;
+
+/** Resolve an agent's explicit model override; preserve profile and parent fallback behavior otherwise. */
+export function resolveProfileModel(
+	spec: ModelSpec | undefined,
+	registry: ExtensionContext["modelRegistry"],
+	parentModel: ExtensionContext["model"],
+	configuredModel?: string,
+): { model: ExtensionModel | undefined } {
+	if (configuredModel || spec === STRONG_REASONING_ALIAS) {
+		const target = configuredModel ?? STRONG_REASONING_ALIAS;
+		const source = typeof spec === "string" ? spec : "profile";
+		const available = registry.getAvailable();
+		const slash = target.indexOf("/");
+		const matches = slash > 0
+			? available.filter((model) => model.provider === target.slice(0, slash) && model.id === target.slice(slash + 1))
+			: available.filter((model) => model.id === target || model.name === target);
+		if (matches.length === 1) return { model: matches[0] };
+		if (matches.length > 1) {
+			throw new Error(`Model selection for "${source}" is ambiguous: ${matches.map((model) => `${model.provider}/${model.id}`).join(", ")}`);
+		}
+		if (!configuredModel) return { model: parentModel };
+		throw new Error(`Model selection for "${source}" target "${target}" is not available`);
+	}
+	if (spec && typeof spec !== "string") return { model: spec };
+	if (typeof spec === "string") {
+		const slash = spec.indexOf("/");
+		return {
+			model: slash > 0 ? registry.find(spec.slice(0, slash), spec.slice(slash + 1)) : undefined,
+		};
+	}
+	return { model: parentModel };
+}
 
 function isBuiltIn(name: string): name is BuiltInAgentName {
 	return (builtInAgentNames as readonly string[]).includes(name);
@@ -47,6 +182,8 @@ interface RunDetails {
 	activity: string[];
 	filesRead: string[];
 	filesModified: string[];
+	verdict?: string;
+	confidence?: string;
 	error?: string;
 	finalText?: string;
 }
@@ -173,6 +310,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const getManager = (ctx: ExtensionContext): SubagentManager => {
 		manager ??= new SubagentManager({
 			cwd: ctx.cwd,
+			authStorage: ctx.modelRegistry.authStorage,
+			modelRegistry: ctx.modelRegistry,
 			artifactsDir: `${ctx.cwd}/.pi/subagent-runs`,
 		});
 		return manager;
@@ -181,6 +320,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		await manager?.abortAll();
 	});
+
+	pi.on("before_agent_start", (event) => ({ systemPrompt: appendOracleGuidance(event.systemPrompt) }));
 
 	pi.registerTool({
 		name: "subagent",
@@ -194,18 +335,27 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const profile: SubagentProfile = isBuiltIn(params.agent)
 				? await loadBuiltInAgent(params.agent)
 				: await loadProfileFile(params.agent);
+			const config = await loadSubagentConfig();
+			const modelResolution = resolveProfileModel(profile.model, ctx.modelRegistry, ctx.model, config.agents[profile.name]?.model);
+			const sessionFile = profile.contextMode === "fork" ? ctx.sessionManager.getSessionFile() : undefined;
+			if (profile.contextMode === "fork" && !sessionFile) throw new Error(`${profile.name} requires a persisted parent session`);
+			const leafId = sessionFile ? ctx.sessionManager.getLeafId() : undefined;
+			const context = contextForSubagent(
+				params.files,
+				params.includeDiff,
+				sessionFile ? { sessionFile, ...(leafId ? { entryId: leafId } : {}) } : undefined,
+			);
 			const handle = getManager(ctx).spawn(profile, params.task, {
-				...(params.files?.length ? { context: { files: params.files } } : {}),
+				...(context ? { context } : {}),
 				...(signal ? { signal } : {}),
-				// Child inherits the parent session's current model unless the card pins one.
-				...(ctx.model && !profile.model ? { overrides: { model: ctx.model } } : {}),
+				...(modelResolution.model ? { overrides: { model: modelResolution.model } } : {}),
 			});
 			runs.push(handle);
 
 			const details: RunDetails = {
 				agent: profile.name,
 				task: params.task,
-				model: resolveModel(profile, handle.usage, ctx),
+				model: resolveModel(handle.profile, handle.usage, ctx),
 				status: handle.status,
 				usage: handle.usage,
 				milestones: [],
@@ -218,7 +368,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const emit = () => {
 				details.status = handle.status;
 				details.usage = handle.usage;
-				details.model = resolveModel(profile, handle.usage, ctx);
+				details.model = resolveModel(handle.profile, handle.usage, ctx);
 				renderOverview(ctx);
 				const preview = [
 					`subagent ${details.agent} · ${statusWord(details.status)}`,
@@ -260,10 +410,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			details.usage = result.usage;
 			details.filesRead = result.disclosure.filesRead;
 			details.filesModified = result.disclosure.filesModified;
-			details.finalText =
-				result.output !== undefined && typeof result.output !== "string"
+			const oracleReport = oracleReportFromOutput(result.output);
+			if (oracleReport) {
+				details.verdict = oracleReport.verdict;
+				details.confidence = oracleReport.confidence;
+				details.finalText = oracleReport.reportMarkdown;
+			} else {
+				details.finalText = result.output !== undefined && typeof result.output !== "string"
 					? JSON.stringify(result.output, null, 2)
 					: result.text;
+			}
 			if (result.error) details.error = `${result.error.kind}: ${result.error.message}`;
 
 			const summary = [
@@ -306,6 +462,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					`${statusIcon(details.status, theme)} ${theme.fg("toolTitle", theme.bold(details.agent))} ` +
 					theme.fg("muted", statusWord(details.status));
 				if (usageStr) line += ` ${theme.fg("dim", usageStr)}`;
+				if (details.verdict) line += ` ${theme.fg(details.verdict === "blocked" ? "error" : "accent", details.verdict)}`;
+				if (details.confidence) line += ` ${theme.fg("dim", `confidence:${details.confidence}`)}`;
 				return line;
 			};
 
@@ -387,6 +545,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					})
 				: ["No subagent runs yet."];
 			if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("oracle", {
+		description: "Ask Oracle for a read-only second opinion with the current diff",
+		handler: async (args, ctx) => {
+			const prompt = oracleCommandPrompt(args);
+			if (!prompt) {
+				ctx.ui.notify("Usage: /oracle <question>", "error");
+				return;
+			}
+			pi.sendUserMessage(prompt);
 		},
 	});
 }

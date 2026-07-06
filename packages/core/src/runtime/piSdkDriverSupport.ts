@@ -27,6 +27,14 @@ export function resolveActiveTools(profile: SubagentProfile): string[] | undefin
 	return [...new Set([...(profile.tools ?? DEFAULT_TOOLS), outputTool])];
 }
 
+/** Keep Oracle read-only even when a profile loses its allowlist or spawn overrides weaken it. */
+export function assertOracleReadOnly(profile: SubagentProfile): void {
+	if (profile.name !== "oracle" && profile.name !== "oracle-plan") return;
+	if (!profile.tools) throw new Error("Oracle requires an explicit tool allowlist to remain read-only");
+	const forbidden = profile.tools.filter((tool) => tool === "bash" || tool === "edit" || tool === "write");
+	if (forbidden.length > 0) throw new Error(`Oracle must remain read-only; forbidden tools: ${forbidden.join(", ")}`);
+}
+
 export function successfulFileEvent(toolName: string, args: Record<string, unknown>, isError: boolean): SubagentEvent | undefined {
 	if (isError || typeof args.path !== "string") return undefined;
 	if (toolName === "read") return { type: "file_read", path: args.path };

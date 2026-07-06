@@ -5,6 +5,7 @@ import { ArtifactWriter } from "../artifacts/ArtifactWriter.ts";
 import { buildContextPacket } from "../context/buildContext.ts";
 import { resolveOutput } from "../output/resolveOutput.ts";
 import { createPiSdkDriver } from "./piSdkDriver.ts";
+import { assertOracleReadOnly } from "./piSdkDriverSupport.ts";
 import { ManagedSubagentHandle, type SubagentHandle } from "./SubagentHandle.ts";
 import type { DriverEvent, DriverRequest, RuntimeDriverFactory } from "./driver.ts";
 import { EMPTY_USAGE, type ModelSpec, type SpawnOptions, type SubagentDisclosure, type SubagentProfile, type SubagentResult } from "../types.ts";
@@ -65,6 +66,8 @@ export class SubagentManager {
 		if ((options.depth ?? 0) >= this.maxDepth) throw new Error(`Subagent max depth ${this.maxDepth} exceeded`);
 		if ((profile.contextMode ?? "fresh") === "fork" && !options.context?.forkFrom) throw new Error("fork context mode requires context.forkFrom");
 		const effective = { ...profile, ...options.overrides };
+		const oracleName = profile.name === "oracle" || profile.name === "oracle-plan" ? profile.name : undefined;
+		assertOracleReadOnly(oracleName ? { ...effective, name: oracleName } : effective);
 		const handle = new ManagedSubagentHandle(randomUUID(), effective);
 		const concurrencyKey = options.metadata?.concurrencyKey as string | undefined ?? this.options.resolveConcurrencyKey?.(effective);
 		const run = { handle, profile: effective, task, options, ...(concurrencyKey ? { concurrencyKey } : {}) };
