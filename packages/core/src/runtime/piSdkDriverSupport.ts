@@ -41,3 +41,51 @@ export function successfulFileEvent(toolName: string, args: Record<string, unkno
 	if (toolName === "edit" || toolName === "write") return { type: "file_write", path: args.path };
 	return undefined;
 }
+
+function str(args: Record<string, unknown>, key: string): string | undefined {
+	const value = args[key];
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function truncate(text: string, limit = 80): string {
+	return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
+}
+
+/** Renders a short, human-readable description of a tool call for activity disclosure. */
+export function describeToolCall(name: string, args: Record<string, unknown>): string {
+	const path = str(args, "path");
+	switch (name) {
+		case "read":
+			return truncate(`Reading ${path ?? "file"}`);
+		case "grep": {
+			const pattern = str(args, "pattern") ?? str(args, "query") ?? "";
+			const dir = str(args, "path") ?? str(args, "dir");
+			return truncate(`Searching "${pattern}"${dir ? ` in ${dir}` : ""}`);
+		}
+		case "find":
+			return truncate(`Finding ${str(args, "pattern") ?? path ?? ""}`);
+		case "ls":
+			return truncate(`Listing ${path ?? "."}`);
+		case "bash": {
+			const command = str(args, "command") ?? "";
+			return truncate(`Running: ${command.slice(0, 60)}${command.length > 60 ? "..." : ""}`);
+		}
+		case "edit":
+			return truncate(`Editing ${path ?? "file"}`);
+		case "write":
+			return truncate(`Writing ${path ?? "file"}`);
+		default:
+			return truncate(name);
+	}
+}
+
+/** Condenses a thinking/text content block into a single short activity line, or undefined if empty. */
+export function thoughtPreview(text: string): string | undefined {
+	const trimmed = (text ?? "").trim();
+	if (!trimmed) return undefined;
+	const firstLine = trimmed.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
+	if (!firstLine) return undefined;
+	const stripped = firstLine.replace(/^#+\s*/, "").trim();
+	if (!stripped) return undefined;
+	return stripped.length > 100 ? `${stripped.slice(0, 97)}...` : stripped;
+}

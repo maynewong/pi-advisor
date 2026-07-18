@@ -5,7 +5,6 @@ model: strong-reasoning
 thinkingLevel: high
 tools: [read, grep, find, ls]
 contextMode: fork
-maxTurns: 8
 output:
   kind: schema
   schema:

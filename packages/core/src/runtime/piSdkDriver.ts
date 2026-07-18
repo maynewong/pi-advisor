@@ -17,7 +17,7 @@ import { evaluatePermission } from "../permission/evaluatePermission.ts";
 import { PermissionEscalations } from "../permission/PermissionEscalations.ts";
 import type { ContextInput } from "../types.ts";
 import type { DriverRequest, RuntimeDriverFactory } from "./driver.ts";
-import { driverErrorFromMessages, resolveActiveTools, successfulFileEvent } from "./piSdkDriverSupport.ts";
+import { describeToolCall, driverErrorFromMessages, resolveActiveTools, successfulFileEvent, thoughtPreview } from "./piSdkDriverSupport.ts";
 
 interface PiSdkDriverOptions {
 	cwd: string;
@@ -74,6 +74,7 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 		let submitted: unknown;
 		let turns = 0;
 		const pendingTools = new Map<string, { name: string; args: Record<string, unknown> }>();
+		let lastThought: string | undefined;
 		const escalations = new PermissionEscalations(emit);
 		const permissionExtension: ExtensionFactory = (pi) => {
 			pi.on("tool_call", async (event) => {
@@ -148,8 +149,8 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 				if (request.profile.maxTurns && turns > request.profile.maxTurns) void session.abort();
 			}
 			if (event.type === "tool_execution_start") {
-				emit({ type: "tool_call", name: event.toolName, argsPreview: preview(event.args) });
 				const args = event.args && typeof event.args === "object" ? event.args as Record<string, unknown> : {};
+				emit({ type: "tool_call", name: event.toolName, argsPreview: preview(event.args), summary: describeToolCall(event.toolName, args) });
 				pendingTools.set(event.toolCallId, { name: event.toolName, args });
 			}
 			if (event.type === "tool_execution_end") {
@@ -160,6 +161,16 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 					if (fileEvent) emit(fileEvent);
 				}
 				emit({ type: "tool_result", name: event.toolName, ok: !event.isError, summary: preview(event.result) });
+			}
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				for (const part of event.message.content) {
+					const text = part.type === "thinking" ? part.thinking : part.type === "text" ? part.text : undefined;
+					if (text === undefined) continue;
+					const thought = thoughtPreview(text);
+					if (thought === undefined || thought === lastThought) continue;
+					lastThought = thought;
+					emit({ type: "thought", text: thought });
+				}
 			}
 		});
 		return {

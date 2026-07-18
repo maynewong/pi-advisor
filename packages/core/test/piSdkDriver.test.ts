@@ -2,9 +2,11 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, test } from "vitest";
 import {
 	assertOracleReadOnly,
+	describeToolCall,
 	driverErrorFromMessages,
 	resolveActiveTools,
 	successfulFileEvent,
+	thoughtPreview,
 } from "../src/runtime/piSdkDriverSupport.ts";
 import type { SubagentProfile } from "../src/types.ts";
 
@@ -59,5 +61,42 @@ describe("piSdkDriver projections", () => {
 		expect(successfulFileEvent("write", { path: "denied/hack.txt" }, true)).toBeUndefined();
 		expect(successfulFileEvent("write", { path: "allowed/ok.txt" }, false)).toEqual({ type: "file_write", path: "allowed/ok.txt" });
 		expect(successfulFileEvent("read", { path: "notes.txt" }, false)).toEqual({ type: "file_read", path: "notes.txt" });
+	});
+
+	test("describes tool calls in short human-readable terms", () => {
+		expect(describeToolCall("read", { path: "src/index.ts" })).toBe("Reading src/index.ts");
+		expect(describeToolCall("grep", { pattern: "TODO", path: "src" })).toBe('Searching "TODO" in src');
+		expect(describeToolCall("grep", { pattern: "TODO" })).toBe('Searching "TODO"');
+		expect(describeToolCall("find", { pattern: "*.ts" })).toBe("Finding *.ts");
+		expect(describeToolCall("ls", {})).toBe("Listing .");
+		expect(describeToolCall("ls", { path: "src" })).toBe("Listing src");
+		expect(describeToolCall("bash", { command: "npm test" })).toBe("Running: npm test");
+		expect(describeToolCall("edit", { path: "a.ts" })).toBe("Editing a.ts");
+		expect(describeToolCall("write", { path: "a.ts" })).toBe("Writing a.ts");
+		expect(describeToolCall("mystery_tool", { path: "a.ts" })).toBe("mystery_tool");
+	});
+
+	test("truncates long tool call descriptions to roughly 80 characters", () => {
+		const longPath = `src/${"a".repeat(120)}.ts`;
+		const description = describeToolCall("read", { path: longPath });
+		expect(description.length).toBeLessThanOrEqual(80);
+		expect(description.endsWith("...")).toBe(true);
+	});
+
+	test("does not throw on missing or non-string tool args", () => {
+		expect(describeToolCall("read", {})).toBe("Reading file");
+		expect(describeToolCall("bash", { command: 42 })).toBe("Running: ");
+		expect(describeToolCall("grep", {})).toBe('Searching ""');
+	});
+
+	test("condenses thinking or text blocks to a single short line", () => {
+		expect(thoughtPreview("  \n\n  ")).toBeUndefined();
+		expect(thoughtPreview("")).toBeUndefined();
+		expect(thoughtPreview("## Plan\nFirst check the config file")).toBe("Plan");
+		expect(thoughtPreview("Checking the routing logic next")).toBe("Checking the routing logic next");
+		const long = "x".repeat(150);
+		const preview = thoughtPreview(long);
+		expect(preview?.length).toBeLessThanOrEqual(100);
+		expect(preview?.endsWith("...")).toBe(true);
 	});
 });

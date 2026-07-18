@@ -56,13 +56,14 @@ export type SubagentStatus = "queued" | "running" | "waiting_permission" | "comp
 export type SubagentEvent =
 	| { type: "started"; id: string; metadata?: Record<string, unknown> }
 	| { type: "turn"; index: number }
-	| { type: "tool_call"; name: string; argsPreview: string }
+	| { type: "tool_call"; name: string; argsPreview: string; summary?: string }
 	| { type: "tool_result"; name: string; ok: boolean; summary: string }
 	| { type: "file_read"; path: string }
 	| { type: "file_write"; path: string }
 	| { type: "permission_blocked"; tool: string; reason: string }
 	| { type: "escalation"; id: string; tool: string; question: string }
 	| { type: "progress"; text: string }
+	| { type: "thought"; text: string }
 	| { type: "completed" }
 	| { type: "failed"; error: string }
 	| { type: "aborted" }

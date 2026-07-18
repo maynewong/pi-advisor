@@ -214,9 +214,11 @@ function formatUsageStats(usage: UsageSnapshot, model?: string): string {
 function activityLine(event: SubagentEvent): string | undefined {
 	switch (event.type) {
 		case "tool_call":
-			return `→ ${event.name} ${event.argsPreview.slice(0, 60)}`;
+			return event.summary ?? `→ ${event.name} ${event.argsPreview.slice(0, 60)}`;
 		case "tool_result":
 			return event.ok ? undefined : `← ${event.name} ${event.summary.slice(0, 60)}`;
+		case "thought":
+			return `✻ ${event.text}`;
 		case "turn":
 			return `turn ${event.index}`;
 		default:
