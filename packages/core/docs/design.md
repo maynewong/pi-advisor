@@ -222,7 +222,6 @@ interface PermissionPolicy {
     deny?: string[];
     mode: "allowlist" | "denylist" | "off";
   };
-  network?: boolean;
   onViolation?: "block" | "escalate";
   escalationTimeoutMs?: number;
 }
@@ -232,8 +231,26 @@ Tool selection remains the first security boundary. Read-only profiles should
 not receive mutation tools. The permission gate is defense in depth and
 provides path- and command-level policy.
 
-Write paths are resolved relative to the explicit run directory. Paths outside
-that directory are rejected. Escalation timeouts fail closed.
+Write paths are resolved relative to the explicit run directory. The run
+directory (cwd) boundary is enforced unconditionally for `edit` and `write`:
+even a profile that omits `write` may not escape cwd. When `write` is present,
+its `deny` and `allow` globs (matched with minimatch) further scope writes;
+when `write` is absent, any path inside cwd is writable. Escalation timeouts
+fail closed.
+
+Bash commands are matched with prefix-token semantics, not path globs. A
+pattern's tokens are compared on whitespace-normalized boundaries; a trailing
+`*` means "these leading tokens followed by any further arguments" (`git diff*`
+matches `git diff --stat` but not `git difftool`). In `allowlist` mode a
+command containing shell control or metacharacters (`;`, `&&`, `||`, `|`,
+`$(`, backtick, `>`, `<`, `&`, newline) can never match an allowlist entry and
+is blocked as a compound command. In `denylist` mode `deny` patterns are
+matched against the whole command and against each chained segment.
+
+Denylist mode is protection against accidental destructive commands, not a
+defense against an adversarial model: a model that intends to bypass it can
+compose commands the denylist does not enumerate. Real isolation comes from
+tool selection and, where needed, workspace or container boundaries.
 
 ## 6. Context Modes
 
@@ -328,6 +345,12 @@ limited to the success path.
 
 Artifact write or workspace cleanup failures update the final result rather
 than disappearing into logs.
+
+`pruneSubagentRuns(dir, { retentionDays, maxRuns })` is a policy-free retention
+helper: it deletes run directories older than `retentionDays` (0 disables age
+pruning) and then trims the newest survivors down to `maxRuns`. Core takes only
+explicit parameters; where the bucket lives and when to prune are host
+decisions.
 
 ## 12. UX Integration
 

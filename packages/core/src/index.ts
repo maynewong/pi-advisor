@@ -1,6 +1,7 @@
 export * from "./types.ts";
 export * from "./profile/loadProfile.ts";
 export * from "./artifacts/readRuns.ts";
+export * from "./artifacts/pruneRuns.ts";
 export * from "./context/buildContext.ts";
 export * from "./permission/evaluatePermission.ts";
 export * from "./permission/PermissionEscalations.ts";

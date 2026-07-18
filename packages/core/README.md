@@ -8,7 +8,8 @@ An in-process Pi subagent runtime. It provides a headless manager and handle API
 - `SubagentHandle`: Event streams, subscriptions, `wait()`, `abort()`, `steer()`, `followUp()`, and permission resolution.
 - Markdown profiles compatible with YAML frontmatter role cards.
 - `fresh`, `selected`, and `fork` context modes with files, diffs, text packets, and independent fork sessions.
-- Write globs and bash allowlist, denylist, or disabled policies enforced by an inline child extension.
+- Write globs plus an unconditional cwd boundary, and bash allowlist, denylist, or disabled policies enforced by an inline child extension. Bash matching is prefix-token aware; allowlist mode rejects compound commands, and denylist mode also inspects each chained segment (accident protection, not adversary defense).
+- `pruneSubagentRuns(dir, { retentionDays, maxRuns })`: policy-free retention for an artifacts bucket.
 - Supervisor escalation with fail-closed timeouts.
 - Text and TypeBox schema output contracts with `submit_result` and final-text JSON fallback.
 - Mechanical disclosure and usage collection from child events and assistant usage.

@@ -48,7 +48,7 @@ describe("piSdkDriver projections", () => {
 	test("rejects oracle profiles that expose mutating tools or SDK defaults", () => {
 		const safe: SubagentProfile = { name: "oracle", description: "reasons", systemPrompt: "analyze", tools: ["read", "grep"] };
 		const unsafe: SubagentProfile = { ...safe, tools: ["read", "bash"] };
-		const unsafePlan: SubagentProfile = { ...safe, name: "oracle-plan", tools: ["read", "write"] };
+		const unsafePlan: SubagentProfile = { ...safe, name: "oracle", tools: ["read", "write"] };
 		const implicitDefaults: SubagentProfile = { name: "oracle", description: "reasons", systemPrompt: "analyze" };
 
 		expect(() => assertOracleReadOnly(safe)).not.toThrow();

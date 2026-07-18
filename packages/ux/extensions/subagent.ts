@@ -5,24 +5,33 @@
  * widget, a compact renderCall line, and a renderResult view that shows
  * milestones/activity while running and a full markdown report when done.
  */
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { isAbsolute, join, resolve } from "node:path";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	SubagentManager,
 	loadProfileFile,
+	pruneSubagentRuns,
 	type ContextInput,
-	type ModelSpec,
+	type SpawnOptions,
 	type SubagentEvent,
 	type SubagentHandle,
 	type SubagentProfile,
+	type SubagentResult,
 	type SubagentStatus,
 	type UsageSnapshot,
 } from "pi-subagent-core";
-import { builtInAgentNames, loadBuiltInAgent, type BuiltInAgentName } from "../src/index.ts";
+import {
+	builtInAgentNames,
+	createModelResolver,
+	loadBuiltInAgent,
+	oracleReportSchema,
+	type BuiltInAgentName,
+} from "../src/index.ts";
 
 const parameters = Type.Object({
 	agent: Type.String({
@@ -33,11 +42,27 @@ const parameters = Type.Object({
 		description: "Optional files to inject into the subagent context packet",
 	})),
 	includeDiff: Type.Optional(Type.Boolean({
-		description: "Inject the current git working tree diff into the subagent context packet",
+		description: "Inject the current git working tree diff (the working tree compared against HEAD) into the subagent context packet",
+	})),
+	inheritConversation: Type.Optional(Type.Boolean({
+		description: "Fork the current conversation into the subagent so it inherits the parent context. Overrides the agent's context mode to fork; requires a persisted session.",
+	})),
+	writeScope: Type.Optional(Type.Array(Type.String(), {
+		description: "Restrict the subagent's file writes to these globs (relative to cwd).",
+	})),
+	maxTurns: Type.Optional(Type.Number({
+		description: "Cap the subagent's turn budget for this run.",
+	})),
+	background: Type.Optional(Type.Boolean({
+		description: "Start the run in the background and return immediately with a run id; fetch the result later with subagent_result.",
 	})),
 });
 
-const STRONG_REASONING_ALIAS = "strong-reasoning";
+const resultParameters = Type.Object({
+	id: Type.String({ description: "Run id returned by a background subagent call" }),
+	wait: Type.Optional(Type.Boolean({ description: "Block until the run reaches a terminal state before returning." })),
+});
+
 const MODEL_CONFIG_FILE = "subagent-kit.json";
 const ORACLE_GUIDANCE = `Consider consulting the oracle subagent (read-only second opinion) before editing when:
 - the change touches auth, billing, permissions, data migration, or a public API contract;
@@ -46,11 +71,23 @@ const ORACLE_GUIDANCE = `Consider consulting the oracle subagent (read-only seco
 - your own confidence in the plan is low.
 Always tell the user you are consulting oracle and why. Never use oracle for typo fixes, renames, small clearly-scoped bugs, or file search (use scout for search).`;
 
-const ORACLE_VERDICTS = new Set(["safe_to_proceed", "proceed_with_changes", "blocked", "need_more_information"]);
-const ORACLE_CONFIDENCE = new Set(["low", "medium", "high"]);
+/** Enum sets for Oracle routing, derived from the shared output schema so they are never hardcoded twice. */
+function schemaEnum(key: string): Set<string> {
+	const prop = (oracleReportSchema as { properties?: Record<string, { enum?: unknown }> }).properties?.[key];
+	return new Set(Array.isArray(prop?.enum) ? (prop.enum as string[]) : []);
+}
+const ORACLE_VERDICTS = schemaEnum("verdict");
+const ORACLE_CONFIDENCE = schemaEnum("confidence");
+
+const DISCLOSURE_LIMIT = 20;
+const TERMINAL_STATUSES = new Set<SubagentStatus>(["completed", "failed", "aborted", "timeout"]);
 
 export interface SubagentUserConfig {
 	agents: Record<string, { model?: string }>;
+	oracleGuidance?: boolean;
+	artifactsDir?: string;
+	retentionDays?: number;
+	maxRuns?: number;
 }
 
 export interface OracleReportView {
@@ -61,6 +98,12 @@ export interface OracleReportView {
 
 function isMissingFile(error: unknown): boolean {
 	return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function validateNonNegativeNumber(value: unknown, path: string, key: string): void {
+	if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+		throw new Error(`Invalid ${path}: ${key} must be a non-negative number`);
+	}
 }
 
 /** Load user-scoped agent overrides without reading project configuration or provider credentials. */
@@ -80,19 +123,35 @@ export async function loadSubagentConfig(agentDir = getAgentDir()): Promise<Suba
 		throw new Error(`Invalid ${path}: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`Invalid ${path}: expected an object`);
-	const agents = (parsed as Record<string, unknown>).agents;
-	if (agents === undefined) return { agents: {} };
-	if (!agents || typeof agents !== "object" || Array.isArray(agents)) throw new Error(`Invalid ${path}: agents must be an object`);
-	for (const [name, settings] of Object.entries(agents)) {
-		if (!name.trim() || !settings || typeof settings !== "object" || Array.isArray(settings)) {
-			throw new Error(`Invalid ${path}: agents entries must be named objects`);
+	const root = parsed as Record<string, unknown>;
+	const agents = root.agents;
+	const config: SubagentUserConfig = { agents: {} };
+	if (agents !== undefined) {
+		if (!agents || typeof agents !== "object" || Array.isArray(agents)) throw new Error(`Invalid ${path}: agents must be an object`);
+		for (const [name, settings] of Object.entries(agents)) {
+			if (!name.trim() || !settings || typeof settings !== "object" || Array.isArray(settings)) {
+				throw new Error(`Invalid ${path}: agents entries must be named objects`);
+			}
+			const model = (settings as Record<string, unknown>).model;
+			if (model !== undefined && (typeof model !== "string" || !model.trim())) {
+				throw new Error(`Invalid ${path}: agents.${name}.model must be a non-empty string`);
+			}
 		}
-		const model = (settings as Record<string, unknown>).model;
-		if (model !== undefined && (typeof model !== "string" || !model.trim())) {
-			throw new Error(`Invalid ${path}: agents.${name}.model must be a non-empty string`);
-		}
+		config.agents = agents as SubagentUserConfig["agents"];
 	}
-	return { agents: agents as SubagentUserConfig["agents"] };
+	if (root.oracleGuidance !== undefined) {
+		if (typeof root.oracleGuidance !== "boolean") throw new Error(`Invalid ${path}: oracleGuidance must be a boolean`);
+		config.oracleGuidance = root.oracleGuidance;
+	}
+	if (root.artifactsDir !== undefined) {
+		if (typeof root.artifactsDir !== "string" || !root.artifactsDir.trim()) throw new Error(`Invalid ${path}: artifactsDir must be a non-empty string`);
+		config.artifactsDir = root.artifactsDir;
+	}
+	validateNonNegativeNumber(root.retentionDays, path, "retentionDays");
+	validateNonNegativeNumber(root.maxRuns, path, "maxRuns");
+	if (root.retentionDays !== undefined) config.retentionDays = root.retentionDays as number;
+	if (root.maxRuns !== undefined) config.maxRuns = root.maxRuns as number;
+	return config;
 }
 
 /** Append the parent-facing consultation policy once per assembled prompt. */
@@ -131,38 +190,24 @@ export function contextForSubagent(
 	};
 }
 
-type ExtensionModel = NonNullable<ExtensionContext["model"]>;
+/** Resolve the per-project artifacts bucket, honoring an explicit override relative to cwd. */
+export function resolveArtifactsDir(cwd: string, override?: string): string {
+	if (override) return isAbsolute(override) ? override : resolve(cwd, override);
+	const collapsed = cwd.replace(/[^a-zA-Z0-9]+/g, "-");
+	const slug = collapsed.slice(-40).replace(/^-+|-+$/g, "");
+	const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+	return join(getAgentDir(), "subagent-runs", `${slug}-${hash}`);
+}
 
-/** Resolve an agent's explicit model override; preserve profile and parent fallback behavior otherwise. */
-export function resolveProfileModel(
-	spec: ModelSpec | undefined,
-	registry: ExtensionContext["modelRegistry"],
-	parentModel: ExtensionContext["model"],
-	configuredModel?: string,
-): { model: ExtensionModel | undefined } {
-	if (configuredModel || spec === STRONG_REASONING_ALIAS) {
-		const target = configuredModel ?? STRONG_REASONING_ALIAS;
-		const source = typeof spec === "string" ? spec : "profile";
-		const available = registry.getAvailable();
-		const slash = target.indexOf("/");
-		const matches = slash > 0
-			? available.filter((model) => model.provider === target.slice(0, slash) && model.id === target.slice(slash + 1))
-			: available.filter((model) => model.id === target || model.name === target);
-		if (matches.length === 1) return { model: matches[0] };
-		if (matches.length > 1) {
-			throw new Error(`Model selection for "${source}" is ambiguous: ${matches.map((model) => `${model.provider}/${model.id}`).join(", ")}`);
-		}
-		if (!configuredModel) return { model: parentModel };
-		throw new Error(`Model selection for "${source}" target "${target}" is not available`);
-	}
-	if (spec && typeof spec !== "string") return { model: spec };
-	if (typeof spec === "string") {
-		const slash = spec.indexOf("/");
-		return {
-			model: slash > 0 ? registry.find(spec.slice(0, slash), spec.slice(slash + 1)) : undefined,
-		};
-	}
-	return { model: parentModel };
+/** Ask the host to approve or deny a suspended tool call; fail closed when no interactive UI is available. */
+export async function escalationDecision(
+	ui: Pick<ExtensionUIContext, "confirm">,
+	hasUI: boolean,
+	event: { tool: string; question: string },
+): Promise<"allow" | "deny"> {
+	if (!hasUI) return "deny";
+	const approved = await ui.confirm("Subagent permission request", `${event.tool}: ${event.question}`);
+	return approved ? "allow" : "deny";
 }
 
 function isBuiltIn(name: string): name is BuiltInAgentName {
@@ -171,6 +216,7 @@ function isBuiltIn(name: string): name is BuiltInAgentName {
 
 /** Structured details streamed via onUpdate and returned in the final tool result. */
 interface RunDetails {
+	id: string;
 	agent: string;
 	task: string;
 	model?: string;
@@ -182,10 +228,21 @@ interface RunDetails {
 	activity: string[];
 	filesRead: string[];
 	filesModified: string[];
+	filesReadMore?: string;
+	filesModifiedMore?: string;
+	artifactsDir?: string;
 	verdict?: string;
 	confidence?: string;
 	error?: string;
 	finalText?: string;
+}
+
+interface TrackedRun {
+	handle: SubagentHandle;
+	profile: SubagentProfile;
+	details: RunDetails;
+	artifactsDir: string;
+	finalize: Promise<SubagentResult>;
 }
 
 const ACTIVITY_LIMIT = 6;
@@ -209,6 +266,13 @@ function formatUsageStats(usage: UsageSnapshot, model?: string): string {
 	if (usage.contextTokens && usage.contextTokens > 0) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
 	if (model) parts.push(model);
 	return parts.join(" ");
+}
+
+/** Cap a disclosure list for the parent-facing surfaces; the full list stays in artifacts. */
+function capDisclosure(paths: string[], artifactsDir?: string): { list: string[]; more?: string } {
+	if (paths.length <= DISCLOSURE_LIMIT) return { list: paths };
+	const remaining = paths.length - DISCLOSURE_LIMIT;
+	return { list: paths.slice(0, DISCLOSURE_LIMIT), more: `(+${remaining} more, see artifacts${artifactsDir ? ` ${artifactsDir}` : ""})` };
 }
 
 function activityLine(event: SubagentEvent): string | undefined {
@@ -305,25 +369,163 @@ function renderOverview(ctx: ExtensionContext): void {
 	ctx.ui.setWidget("subagent-overview", lines);
 }
 
-export default function subagentExtension(pi: ExtensionAPI) {
-	let manager: SubagentManager | undefined;
-	const runs: SubagentHandle[] = [];
+/** Fold a terminal result into the streamed details, capping disclosure for parent-facing surfaces. */
+function applyResult(details: RunDetails, result: SubagentResult): void {
+	details.status = result.status;
+	details.usage = result.usage;
+	details.artifactsDir = result.artifacts?.dir;
+	const read = capDisclosure(result.disclosure.filesRead, result.artifacts?.dir);
+	const modified = capDisclosure(result.disclosure.filesModified, result.artifacts?.dir);
+	details.filesRead = read.list;
+	details.filesReadMore = read.more;
+	details.filesModified = modified.list;
+	details.filesModifiedMore = modified.more;
+	const oracleReport = oracleReportFromOutput(result.output);
+	if (oracleReport) {
+		details.verdict = oracleReport.verdict;
+		details.confidence = oracleReport.confidence;
+		details.finalText = oracleReport.reportMarkdown;
+	} else {
+		details.finalText = result.output !== undefined && typeof result.output !== "string"
+			? JSON.stringify(result.output, null, 2)
+			: result.text;
+	}
+	if (result.error) details.error = `${result.error.kind}: ${result.error.message}`;
+}
 
-	const getManager = (ctx: ExtensionContext): SubagentManager => {
-		manager ??= new SubagentManager({
+/** Build the completed-run summary text shared by the foreground path and subagent_result. */
+function completedSummary(profileName: string, result: SubagentResult, details: RunDetails): string {
+	const readLine = details.filesRead.length
+		? `read: ${details.filesRead.join(", ")}${details.filesReadMore ? ` ${details.filesReadMore}` : ""}`
+		: "";
+	const modifiedLine = details.filesModified.length
+		? `modified: ${details.filesModified.join(", ")}${details.filesModifiedMore ? ` ${details.filesModifiedMore}` : ""}`
+		: "";
+	return [
+		`agent: ${profileName} · status: ${result.status} · turns: ${result.usage.turns} · cost: $${result.usage.cost.toFixed(4)}`,
+		readLine,
+		modifiedLine,
+		result.error ? `error(${result.error.kind}): ${result.error.message}` : "",
+		result.artifacts?.dir ? `artifacts: ${result.artifacts.dir}` : "",
+		"",
+		details.finalText ?? "",
+	].filter((line) => line !== "").join("\n");
+}
+
+export default function subagentExtension(pi: ExtensionAPI) {
+	const managers = new Map<string, { manager: SubagentManager; artifactsDir: string }>();
+	const trackedRuns = new Map<string, TrackedRun>();
+
+	const getManager = (ctx: ExtensionContext, config: SubagentUserConfig): { manager: SubagentManager; artifactsDir: string } => {
+		const existing = managers.get(ctx.cwd);
+		if (existing) return existing;
+		const artifactsDir = resolveArtifactsDir(ctx.cwd, config.artifactsDir);
+		const resolveModelFn = createModelResolver({ registry: ctx.modelRegistry, parentModel: ctx.model });
+		const manager = new SubagentManager({
 			cwd: ctx.cwd,
 			authStorage: ctx.modelRegistry.authStorage,
 			modelRegistry: ctx.modelRegistry,
-			artifactsDir: `${ctx.cwd}/.pi/subagent-runs`,
+			resolveModel: resolveModelFn,
+			artifactsDir,
 		});
-		return manager;
+		const entry = { manager, artifactsDir };
+		managers.set(ctx.cwd, entry);
+		// Lazy retention: fire-and-forget prune of this project's bucket; never fail a spawn on cleanup errors.
+		void pruneSubagentRuns(artifactsDir, {
+			retentionDays: config.retentionDays ?? 14,
+			maxRuns: config.maxRuns ?? 200,
+		}).catch(() => {});
+		return entry;
 	};
 
 	pi.on("session_shutdown", async () => {
-		await manager?.abortAll();
+		await Promise.all([...managers.values()].map((entry) => entry.manager.abortAll()));
 	});
 
-	pi.on("before_agent_start", (event) => ({ systemPrompt: appendOracleGuidance(event.systemPrompt) }));
+	pi.on("before_agent_start", async (event) => {
+		const config = await loadSubagentConfig();
+		if (config.oracleGuidance === false) return { systemPrompt: event.systemPrompt };
+		return { systemPrompt: appendOracleGuidance(event.systemPrompt) };
+	});
+
+	/** Spawn a run, wire live streaming/overview, and return a detached finalize promise. */
+	const startRun = (
+		ctx: ExtensionContext,
+		profile: SubagentProfile,
+		task: string,
+		spawnOptions: SpawnOptions,
+		artifactsBucket: string,
+		manager: SubagentManager,
+		onUpdate: ((update: { content: { type: "text"; text: string }[]; details: RunDetails }) => void) | undefined,
+		background: boolean,
+	): TrackedRun => {
+		const handle = manager.spawn(profile, task, spawnOptions);
+		const details: RunDetails = {
+			id: handle.id,
+			agent: profile.name,
+			task,
+			model: resolveModel(handle.profile, handle.usage, ctx),
+			status: handle.status,
+			usage: handle.usage,
+			milestones: [],
+			activity: [],
+			filesRead: [],
+			filesModified: [],
+		};
+		activeRuns.set(handle.id, details);
+
+		const emit = () => {
+			details.status = handle.status;
+			details.usage = handle.usage;
+			details.model = resolveModel(handle.profile, handle.usage, ctx);
+			renderOverview(ctx);
+			if (background) return;
+			const preview = [
+				`subagent ${details.agent} · ${statusWord(details.status)}`,
+				...details.milestones.slice(-3),
+				...details.activity.slice(-3),
+			].join("\n");
+			onUpdate?.({ content: [{ type: "text", text: preview }], details });
+		};
+
+		const unsubscribe = handle.subscribe((event: SubagentEvent) => {
+			if (event.type === "progress") {
+				details.milestones.push(event.text);
+			} else if (event.type === "permission_blocked") {
+				details.milestones.push(`⛔ ${event.tool}: ${event.reason}`);
+			} else if (event.type === "escalation") {
+				void escalationDecision(ctx.ui, ctx.hasUI, event)
+					.catch(() => "deny" as const)
+					.then((decision) => {
+						handle.resolveEscalation(event.id, decision);
+						details.milestones.push(`${decision === "allow" ? "✅ allowed" : "⛔ denied"} escalation: ${event.tool}`);
+						emit();
+					});
+			} else if (event.type === "failed") {
+				details.error = event.error;
+			}
+			const line = activityLine(event);
+			if (line !== undefined) {
+				details.activity.push(line);
+				if (details.activity.length > ACTIVITY_LIMIT) details.activity.shift();
+			}
+			emit();
+		});
+
+		const finalize = handle.wait().then((result) => {
+			applyResult(details, result);
+			return result;
+		}).finally(() => {
+			// Subscription cleanup is tied to run termination, not to the tool call that started it.
+			unsubscribe();
+			activeRuns.delete(handle.id);
+			renderOverview(ctx);
+		});
+
+		const tracked: TrackedRun = { handle, profile, details, artifactsDir: join(artifactsBucket, handle.id), finalize };
+		trackedRuns.set(handle.id, tracked);
+		return tracked;
+	};
 
 	pi.registerTool({
 		name: "subagent",
@@ -338,104 +540,54 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				? await loadBuiltInAgent(params.agent)
 				: await loadProfileFile(params.agent);
 			const config = await loadSubagentConfig();
-			const modelResolution = resolveProfileModel(profile.model, ctx.modelRegistry, ctx.model, config.agents[profile.name]?.model);
-			const sessionFile = profile.contextMode === "fork" ? ctx.sessionManager.getSessionFile() : undefined;
-			if (profile.contextMode === "fork" && !sessionFile) throw new Error(`${profile.name} requires a persisted parent session`);
+			const { manager, artifactsDir } = getManager(ctx, config);
+
+			const forkRequested = params.inheritConversation === true || profile.contextMode === "fork";
+			const sessionFile = forkRequested ? ctx.sessionManager.getSessionFile() : undefined;
+			if (forkRequested && !sessionFile) {
+				throw new Error(`${profile.name} requires a persisted parent session to inherit the conversation`);
+			}
 			const leafId = sessionFile ? ctx.sessionManager.getLeafId() : undefined;
 			const context = contextForSubagent(
 				params.files,
 				params.includeDiff,
 				sessionFile ? { sessionFile, ...(leafId ? { entryId: leafId } : {}) } : undefined,
 			);
-			const handle = getManager(ctx).spawn(profile, params.task, {
+
+			const overrides: Partial<SubagentProfile> = {};
+			const configuredModel = config.agents[profile.name]?.model;
+			if (configuredModel) overrides.model = configuredModel;
+			if (forkRequested) overrides.contextMode = "fork";
+			if (params.writeScope?.length) {
+				overrides.permission = {
+					...profile.permission,
+					write: { allow: params.writeScope, ...(profile.permission?.write?.deny ? { deny: profile.permission.write.deny } : {}) },
+				};
+			}
+			if (typeof params.maxTurns === "number") overrides.maxTurns = params.maxTurns;
+
+			const background = params.background === true;
+			const spawnOptions: SpawnOptions = {
 				...(context ? { context } : {}),
-				...(signal ? { signal } : {}),
-				...(modelResolution.model ? { overrides: { model: modelResolution.model } } : {}),
-			});
-			runs.push(handle);
-
-			const details: RunDetails = {
-				agent: profile.name,
-				task: params.task,
-				model: resolveModel(handle.profile, handle.usage, ctx),
-				status: handle.status,
-				usage: handle.usage,
-				milestones: [],
-				activity: [],
-				filesRead: [],
-				filesModified: [],
+				...(signal && !background ? { signal } : {}),
+				...(Object.keys(overrides).length ? { overrides } : {}),
 			};
-			activeRuns.set(handle.id, details);
 
-			const emit = () => {
-				details.status = handle.status;
-				details.usage = handle.usage;
-				details.model = resolveModel(handle.profile, handle.usage, ctx);
-				renderOverview(ctx);
-				const preview = [
-					`subagent ${details.agent} · ${statusWord(details.status)}`,
-					...details.milestones.slice(-3),
-					...details.activity.slice(-3),
+			const tracked = startRun(ctx, profile, params.task, spawnOptions, artifactsDir, manager, onUpdate, background);
+
+			if (background) {
+				const text = [
+					`agent: ${profile.name} · started in background · id: ${tracked.handle.id}`,
+					`artifacts: ${tracked.artifactsDir}`,
+					`Fetch the result with subagent_result { id: ${JSON.stringify(tracked.handle.id)} }.`,
 				].join("\n");
-				onUpdate?.({
-					content: [{ type: "text", text: preview }],
-					details,
-				});
-			};
-
-			const unsubscribe = handle.subscribe((event: SubagentEvent) => {
-				if (event.type === "progress") {
-					details.milestones.push(event.text);
-				} else if (event.type === "permission_blocked") {
-					details.milestones.push(`⛔ ${event.tool}: ${event.reason}`);
-				} else if (event.type === "failed") {
-					details.error = event.error;
-				}
-				const line = activityLine(event);
-				if (line !== undefined) {
-					details.activity.push(line);
-					if (details.activity.length > ACTIVITY_LIMIT) details.activity.shift();
-				}
-				emit();
-			});
-
-			let result: Awaited<ReturnType<typeof handle.wait>>;
-			try {
-				result = await handle.wait();
-			} finally {
-				unsubscribe();
-				activeRuns.delete(handle.id);
-				renderOverview(ctx);
+				return { content: [{ type: "text", text }], details: tracked.details, isError: false };
 			}
 
-			details.status = result.status;
-			details.usage = result.usage;
-			details.filesRead = result.disclosure.filesRead;
-			details.filesModified = result.disclosure.filesModified;
-			const oracleReport = oracleReportFromOutput(result.output);
-			if (oracleReport) {
-				details.verdict = oracleReport.verdict;
-				details.confidence = oracleReport.confidence;
-				details.finalText = oracleReport.reportMarkdown;
-			} else {
-				details.finalText = result.output !== undefined && typeof result.output !== "string"
-					? JSON.stringify(result.output, null, 2)
-					: result.text;
-			}
-			if (result.error) details.error = `${result.error.kind}: ${result.error.message}`;
-
-			const summary = [
-				`agent: ${profile.name} · status: ${result.status} · turns: ${result.usage.turns} · cost: $${result.usage.cost.toFixed(4)}`,
-				result.disclosure.filesRead.length ? `read: ${result.disclosure.filesRead.join(", ")}` : "",
-				result.disclosure.filesModified.length ? `modified: ${result.disclosure.filesModified.join(", ")}` : "",
-				result.error ? `error(${result.error.kind}): ${result.error.message}` : "",
-				"",
-				details.finalText ?? "",
-			].filter((line) => line !== "").join("\n");
-
+			const result = await tracked.finalize;
 			return {
-				content: [{ type: "text", text: summary }],
-				details,
+				content: [{ type: "text", text: completedSummary(profile.name, result, tracked.details) }],
+				details: tracked.details,
 				isError: result.status !== "completed",
 			};
 		},
@@ -508,11 +660,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			}
 			if (details.filesRead.length > 0) {
 				container.addChild(new Spacer(1));
-				container.addChild(new Text(theme.fg("muted", "read: ") + theme.fg("dim", details.filesRead.join(", ")), 0, 0));
+				const suffix = details.filesReadMore ? `, ${details.filesReadMore}` : "";
+				container.addChild(new Text(theme.fg("muted", "read: ") + theme.fg("dim", details.filesRead.join(", ") + suffix), 0, 0));
 			}
 			if (details.filesModified.length > 0) {
+				const suffix = details.filesModifiedMore ? `, ${details.filesModifiedMore}` : "";
 				container.addChild(
-					new Text(theme.fg("muted", "modified: ") + theme.fg("dim", details.filesModified.join(", ")), 0, 0),
+					new Text(theme.fg("muted", "modified: ") + theme.fg("dim", details.filesModified.join(", ") + suffix), 0, 0),
 				);
 			}
 			if (details.error) {
@@ -532,17 +686,60 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "subagent_result",
+		label: "Subagent Result",
+		description: "Fetch the result of a background subagent run by id. Pass wait: true to block until it finishes.",
+		parameters: resultParameters,
+		async execute(_toolCallId, params) {
+			const tracked = trackedRuns.get(params.id);
+			if (!tracked) {
+				return { content: [{ type: "text", text: `No subagent run with id ${params.id}` }], details: undefined, isError: true };
+			}
+			const terminal = TERMINAL_STATUSES.has(tracked.handle.status);
+			if (params.wait || terminal) {
+				const result = await tracked.finalize;
+				return {
+					content: [{ type: "text", text: completedSummary(tracked.profile.name, result, tracked.details) }],
+					details: tracked.details,
+					isError: result.status !== "completed",
+				};
+			}
+			const details = tracked.details;
+			const text = [
+				`agent: ${details.agent} · status: ${statusWord(details.status)} · turns: ${details.usage.turns}`,
+				`id: ${tracked.handle.id} · artifacts: ${tracked.artifactsDir}`,
+				...details.milestones.slice(-5),
+			].join("\n");
+			return { content: [{ type: "text", text }], details, isError: false };
+		},
+	});
+
 	pi.registerCommand("subagents", {
-		description: "List subagent runs in this session",
-		handler: async (_args, ctx) => {
-			const lines = runs.length
-				? runs.map((run) => {
+		description: "List subagent runs in this session, or `abort <id>` to abort one",
+		handler: async (args, ctx) => {
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			if (parts[0] === "abort") {
+				const id = parts[1];
+				const tracked = id ? trackedRuns.get(id) : undefined;
+				if (!tracked) {
+					if (ctx.hasUI) ctx.ui.notify(id ? `No subagent run with id ${id}` : "Usage: /subagents abort <id>", "error");
+					return;
+				}
+				await tracked.handle.abort();
+				if (ctx.hasUI) ctx.ui.notify(`Aborted subagent ${id}`, "info");
+				return;
+			}
+			const lines = trackedRuns.size
+				? [...trackedRuns.values()].map((tracked) => {
+						const run = tracked.handle;
 						const usage = run.usage;
 						const model = resolveModel(run.profile, usage, ctx) ?? "";
 						return (
-							`${run.profile.name}  ${run.status}  turns=${usage.turns}  ` +
+							`${run.id}  ${run.profile.name}  ${run.status}  turns=${usage.turns}  ` +
 							`↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)}  $${usage.cost.toFixed(4)}` +
-							(model ? `  ${model}` : "")
+							(model ? `  ${model}` : "") +
+							`\n  ${tracked.artifactsDir}`
 						);
 					})
 				: ["No subagent runs yet."];

@@ -9,7 +9,6 @@ export type ContextMode = "fresh" | "selected" | "fork";
 export interface PermissionPolicy {
 	write?: { allow: string[]; deny?: string[] };
 	bash?: { allow?: string[]; deny?: string[]; mode: "allowlist" | "denylist" | "off" };
-	network?: boolean;
 	onViolation?: "block" | "escalate";
 	escalationTimeoutMs?: number;
 }

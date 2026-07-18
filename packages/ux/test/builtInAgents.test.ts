@@ -2,15 +2,19 @@ import { access, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { builtInAgentNames, getBuiltInAgentPath, loadBuiltInAgent } from "../src/index.ts";
+import { builtInAgentNames, createModelResolver, getBuiltInAgentPath, loadBuiltInAgent, oracleReportSchema } from "../src/index.ts";
 import {
 	appendOracleGuidance,
 	contextForSubagent,
+	escalationDecision,
 	loadSubagentConfig,
 	oracleCommandPrompt,
 	oracleReportFromOutput,
-	resolveProfileModel,
+	resolveArtifactsDir,
 } from "../extensions/subagent.ts";
+import type { SubagentProfile } from "pi-subagent-core";
+
+const anyProfile = { name: "any" } as SubagentProfile;
 
 describe("built-in agents", () => {
 	test("ships loadable markdown profiles for every declared role", async () => {
@@ -23,6 +27,10 @@ describe("built-in agents", () => {
 		expect(profiles.every((profile) => profile.systemPrompt.length > 0)).toBe(true);
 	});
 
+	test("no longer ships a separate oracle-plan role", () => {
+		expect(builtInAgentNames).not.toContain("oracle-plan");
+	});
+
 	test("keeps mutation capability exclusive to the worker role", async () => {
 		const profiles = await Promise.all(builtInAgentNames.map((name) => loadBuiltInAgent(name)));
 		const worker = profiles.find((profile) => profile.name === "worker");
@@ -32,14 +40,22 @@ describe("built-in agents", () => {
 		expect(readOnly.every((profile) => !profile.tools?.includes("edit") && !profile.tools?.includes("write"))).toBe(true);
 	});
 
-	test("configures oracle for high-effort read-only second opinions", async () => {
+	test("worker relies on the cwd boundary and declares no write allowlist", async () => {
+		const worker = await loadBuiltInAgent("worker");
+		expect(worker.permission?.write).toBeUndefined();
+		expect(worker.permission?.bash).toMatchObject({ mode: "denylist" });
+	});
+
+	test("configures oracle for high-effort read-only second opinions with the shared schema", async () => {
 		const oracle = await loadBuiltInAgent("oracle");
 
 		expect(oracle).toMatchObject({
 			model: "strong-reasoning",
 			thinkingLevel: "high",
 			tools: ["read", "grep", "find", "ls"],
+			contextMode: "selected",
 		});
+		expect(oracle.output).toEqual({ kind: "schema", schema: oracleReportSchema });
 		expect(oracle.output).toMatchObject({
 			kind: "schema",
 			schema: {
@@ -56,15 +72,9 @@ describe("built-in agents", () => {
 		}
 	});
 
-	test("ships a fork-context oracle role for plan reviews", async () => {
-		const profile = await loadBuiltInAgent("oracle-plan");
-
-		expect(profile).toMatchObject({
-			name: "oracle-plan",
-			contextMode: "fork",
-			thinkingLevel: "high",
-			tools: ["read", "grep", "find", "ls"],
-		});
+	test("folds plan-review guidance into the single oracle card", async () => {
+		const oracle = await loadBuiltInAgent("oracle");
+		expect(oracle.systemPrompt).toMatch(/parent conversation inherited/i);
 	});
 
 	test("adds the current working tree diff to selected context on request", () => {
@@ -94,48 +104,57 @@ describe("built-in agents", () => {
 		expect(prompt).toContain("Never use oracle for typo fixes");
 	});
 
-	test("resolves an agent model override by a unique bare model id", () => {
+	test("resolves an agent model override by a unique bare model id", async () => {
 		const parent = { id: "parent", name: "Parent" } as never;
 		const strong = { provider: "gateway", id: "gpt-5.5", name: "GPT 5.5" } as never;
 		const registry = { getAvailable: () => [strong] } as never;
+		const resolve = createModelResolver({ registry, parentModel: parent });
 
-		expect(resolveProfileModel("strong-reasoning", registry, parent, "gpt-5.5")).toEqual({
-			model: strong,
-		});
+		await expect(resolve("gpt-5.5", anyProfile)).resolves.toBe(strong);
 	});
 
-	test("gives a per-agent model override precedence over a concrete role-card model", () => {
-		const roleCardModel = { provider: "default", id: "standard", name: "Standard" } as never;
-		const configured = { provider: "gateway", id: "gpt-5.5", name: "GPT 5.5" } as never;
-		const registry = { getAvailable: () => [configured] } as never;
+	test("resolves a provider-qualified model id", async () => {
+		const a = { provider: "gateway-a", id: "gpt-5.5", name: "GPT 5.5" } as never;
+		const b = { provider: "gateway-b", id: "gpt-5.5", name: "GPT 5.5" } as never;
+		const registry = { getAvailable: () => [a, b] } as never;
+		const resolve = createModelResolver({ registry });
 
-		expect(resolveProfileModel(roleCardModel, registry, undefined, "gpt-5.5")).toEqual({ model: configured });
+		await expect(resolve("gateway-b/gpt-5.5", anyProfile)).resolves.toBe(b);
 	});
 
-	test("rejects an ambiguous agent model override instead of silently choosing a provider", () => {
+	test("rejects an ambiguous model target instead of silently choosing a provider", async () => {
 		const models = [
 			{ provider: "gateway-a", id: "gpt-5.5", name: "GPT 5.5" },
 			{ provider: "gateway-b", id: "gpt-5.5", name: "GPT 5.5" },
 		] as never;
 		const registry = { getAvailable: () => models } as never;
+		const resolve = createModelResolver({ registry });
 
-		expect(() => resolveProfileModel("strong-reasoning", registry, undefined, "gpt-5.5"))
-			.toThrow(/ambiguous.*gateway-a\/gpt-5\.5.*gateway-b\/gpt-5\.5/i);
+		await expect(resolve("gpt-5.5", anyProfile)).rejects.toThrow(/ambiguous.*gateway-a\/gpt-5\.5.*gateway-b\/gpt-5\.5/i);
 	});
 
-	test("preserves parent-model fallback when the user has not configured an alias", () => {
+	test("falls back to the parent model for the strong-reasoning alias when nothing matches", async () => {
 		const parentRouter = { provider: "router", id: "auto", name: "Auto" } as never;
 		const registry = { getAvailable: () => [] } as never;
+		const resolve = createModelResolver({ registry, parentModel: parentRouter });
 
-		expect(resolveProfileModel("strong-reasoning", registry, parentRouter)).toEqual({ model: parentRouter });
+		await expect(resolve("strong-reasoning", anyProfile)).resolves.toBe(parentRouter);
 	});
 
-	test("does not fall back when a configured alias target is unavailable", () => {
+	test("does not fall back when a concrete target is unavailable", async () => {
 		const parentRouter = { provider: "router", id: "auto", name: "Auto" } as never;
 		const registry = { getAvailable: () => [] } as never;
+		const resolve = createModelResolver({ registry, parentModel: parentRouter });
 
-		expect(() => resolveProfileModel("strong-reasoning", registry, parentRouter, "gpt-5.5"))
-			.toThrow(/strong-reasoning.*gpt-5\.5.*not available/i);
+		await expect(resolve("gpt-5.5", anyProfile)).rejects.toThrow(/gpt-5\.5.*not available/i);
+	});
+
+	test("passes a concrete model object through untouched", async () => {
+		const concrete = { provider: "gateway", id: "gpt-5.5", name: "GPT 5.5" } as never;
+		const registry = { getAvailable: () => [] } as never;
+		const resolve = createModelResolver({ registry });
+
+		await expect(resolve(concrete, anyProfile)).resolves.toBe(concrete);
 	});
 
 	test("loads per-agent model overrides from the user-level subagent-kit config", async () => {
@@ -150,5 +169,40 @@ describe("built-in agents", () => {
 		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ agents: { oracle: { model: 55 } } }));
 
 		await expect(loadSubagentConfig(dir)).rejects.toThrow(/invalid.*agents.*model/i);
+	});
+
+	test("parses the optional oracleGuidance, artifactsDir, and retention keys", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "subagent-kit-extra-config-"));
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ oracleGuidance: false, artifactsDir: "./runs", retentionDays: 7, maxRuns: 50 }));
+
+		await expect(loadSubagentConfig(dir)).resolves.toEqual({ agents: {}, oracleGuidance: false, artifactsDir: "./runs", retentionDays: 7, maxRuns: 50 });
+	});
+
+	test("rejects a non-boolean oracleGuidance and a negative retentionDays", async () => {
+		const badGuidance = await mkdtemp(join(tmpdir(), "subagent-kit-bad-guidance-"));
+		await writeFile(join(badGuidance, "subagent-kit.json"), JSON.stringify({ oracleGuidance: "yes" }));
+		await expect(loadSubagentConfig(badGuidance)).rejects.toThrow(/oracleGuidance must be a boolean/i);
+
+		const badRetention = await mkdtemp(join(tmpdir(), "subagent-kit-bad-retention-"));
+		await writeFile(join(badRetention, "subagent-kit.json"), JSON.stringify({ retentionDays: -3 }));
+		await expect(loadSubagentConfig(badRetention)).rejects.toThrow(/retentionDays must be a non-negative number/i);
+	});
+
+	test("resolves the global per-project artifacts bucket and honors an override", () => {
+		const bucket = resolveArtifactsDir("/Users/me/code/project");
+		expect(bucket).toMatch(/subagent-runs[\\/][A-Za-z0-9-]+-[0-9a-f]{8}$/);
+
+		expect(resolveArtifactsDir("/repo", "/abs/runs")).toBe("/abs/runs");
+		expect(resolveArtifactsDir("/repo", "runs")).toBe("/repo/runs");
+	});
+
+	test("asks the host to confirm an escalation and fails closed without a UI", async () => {
+		const allowUi = { confirm: async () => true };
+		const denyUi = { confirm: async () => false };
+		const never = { confirm: async () => { throw new Error("should not prompt"); } };
+
+		await expect(escalationDecision(allowUi, true, { tool: "bash", question: "run it?" })).resolves.toBe("allow");
+		await expect(escalationDecision(denyUi, true, { tool: "bash", question: "run it?" })).resolves.toBe("deny");
+		await expect(escalationDecision(never, false, { tool: "bash", question: "run it?" })).resolves.toBe("deny");
 	});
 });

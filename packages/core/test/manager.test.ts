@@ -172,7 +172,7 @@ describe("SubagentManager", () => {
 
 		expect(() => manager.spawn(oracle, "review", { overrides: { tools: ["read", "write"] } })).toThrow(/read-only.*write/i);
 		expect(() => manager.spawn(oracle, "review", { overrides: { name: "worker", tools: ["read", "bash"] } })).toThrow(/read-only.*bash/i);
-		expect(() => manager.spawn({ ...oracle, name: "oracle-plan" }, "review", { overrides: { tools: ["read", "edit"] } })).toThrow(/read-only.*edit/i);
+		expect(() => manager.spawn(oracle, "review", { overrides: { tools: ["read", "edit"] } })).toThrow(/read-only.*edit/i);
 	});
 
 	test("runs in a provisioned workspace and cleans it according to policy", async () => {
