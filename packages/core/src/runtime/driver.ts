@@ -28,6 +28,8 @@ export interface RuntimeDriver {
 	abort(): Promise<void>;
 	steer?(message: string): void | Promise<void>;
 	followUp?(message: string): void | Promise<void>;
+	/** Run another turn on the same retained session after a terminal run, producing a fresh result. */
+	resume?(message: string): Promise<DriverRunResult>;
 	resolveEscalation?(id: string, decision: EscalationDecision): boolean;
 	dispose?(): void | Promise<void>;
 }

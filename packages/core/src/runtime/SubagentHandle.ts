@@ -12,6 +12,8 @@ export interface SubagentHandle {
 	subscribe(listener: (event: SubagentEvent) => void): () => void;
 	steer(message: string): void;
 	followUp(message: string): void;
+	/** Continue a completed run with a follow-up message, resolving with the new terminal result. */
+	resume(message: string): Promise<SubagentResult>;
 	resolveEscalation(id: string, decision: EscalationDecision): boolean;
 	abort(): Promise<void>;
 	wait(): Promise<SubagentResult>;
@@ -24,6 +26,7 @@ export class ManagedSubagentHandle implements SubagentHandle {
 	private readonly resultPromise: Promise<SubagentResult>;
 	private resolveResult!: (result: SubagentResult) => void;
 	private driver?: RuntimeDriver;
+	private resumeRun?: (message: string) => Promise<SubagentResult>;
 	private abortQueued?: () => Promise<void>;
 	private abortRequested = false;
 	private resolveAbortRequested!: () => void;
@@ -51,6 +54,11 @@ export class ManagedSubagentHandle implements SubagentHandle {
 		void this.driver.followUp(message);
 	}
 
+	resume(message: string): Promise<SubagentResult> {
+		if (!this.resumeRun) throw new Error("Subagent run cannot be resumed");
+		return this.resumeRun(message);
+	}
+
 	resolveEscalation(id: string, decision: EscalationDecision): boolean {
 		const resolved = this.driver?.resolveEscalation?.(id, decision) ?? false;
 		if (resolved && this.currentStatus === "waiting_permission") this.currentStatus = "running";
@@ -66,6 +74,7 @@ export class ManagedSubagentHandle implements SubagentHandle {
 	}
 
 	setDriver(driver: RuntimeDriver): void { this.driver = driver; }
+	setResume(resume: (message: string) => Promise<SubagentResult>): void { this.resumeRun = resume; }
 	setQueuedAbort(abort: () => Promise<void>): void { this.abortQueued = abort; }
 	setStatus(status: SubagentStatus): void { this.currentStatus = status; }
 	setUsage(usage: UsageSnapshot): void { this.currentUsage = { ...usage }; }
@@ -78,5 +87,11 @@ export class ManagedSubagentHandle implements SubagentHandle {
 		this.currentUsage = { ...result.usage };
 		this.resolveResult(result);
 		this.stream.close();
+	}
+
+	/** Reflect a resumed turn's terminal state without re-arming the already-resolved wait() promise or reopened stream. */
+	applyResume(result: SubagentResult): void {
+		this.currentStatus = result.status;
+		this.currentUsage = { ...result.usage };
 	}
 }

@@ -7,7 +7,7 @@ import { resolveOutput } from "../output/resolveOutput.ts";
 import { createPiSdkDriver } from "./piSdkDriver.ts";
 import { assertOracleReadOnly } from "./piSdkDriverSupport.ts";
 import { ManagedSubagentHandle, type SubagentHandle } from "./SubagentHandle.ts";
-import type { DriverEvent, DriverRequest, RuntimeDriverFactory } from "./driver.ts";
+import type { DriverEvent, DriverRequest, RuntimeDriver, RuntimeDriverFactory } from "./driver.ts";
 import { EMPTY_USAGE, type ModelSpec, type SpawnOptions, type SubagentDisclosure, type SubagentProfile, type SubagentResult } from "../types.ts";
 import { GitWorktreeProvider, type ProvisionedWorkspace, type WorkspaceProvider } from "../workspace/WorkspaceProvider.ts";
 
@@ -33,10 +33,21 @@ interface QueuedRun {
 	concurrencyKey?: string;
 }
 
+/** State retained after a completed run so a supervisor can continue the conversation with `resume`. */
+interface ResumableRun {
+	run: QueuedRun;
+	driver: RuntimeDriver;
+	disclosure: SubagentDisclosure;
+	writer?: ArtifactWriter;
+	transcript?: string;
+	workspace?: ProvisionedWorkspace;
+}
+
 const TERMINAL = new Set(["completed", "failed", "aborted", "timeout"]);
 
 export class SubagentManager {
 	private readonly handles = new Map<string, ManagedSubagentHandle>();
+	private readonly resumable = new Map<string, ResumableRun>();
 	private readonly queue: QueuedRun[] = [];
 	private active = 0;
 	private readonly maxConcurrent: number;
@@ -94,6 +105,58 @@ export class SubagentManager {
 
 	async abortAll(): Promise<void> {
 		await Promise.all([...this.handles.values()].filter((handle) => !TERMINAL.has(handle.status)).map((handle) => handle.abort()));
+		// Completed runs retain their driver/session so they can be resumed; release those on shutdown.
+		await Promise.all([...this.resumable.values()].map((entry) => entry.driver.dispose?.()));
+		this.resumable.clear();
+	}
+
+	/**
+	 * Continue a completed run with a follow-up message on its retained session. The run must be terminal and
+	 * resumable (completed runs whose driver supports resume). Failures surface as result data, never a rejected
+	 * promise; only an unknown id or an unresumable run throws synchronously.
+	 */
+	async resume(id: string, message: string): Promise<SubagentResult> {
+		if (!message.trim()) throw new Error("Follow-up message cannot be empty");
+		const entry = this.resumable.get(id);
+		if (!entry) throw new Error(`Subagent ${id} is not resumable (only completed runs can be continued)`);
+		const resumeDriver = entry.driver.resume;
+		if (!resumeDriver) throw new Error(`Subagent ${id} does not support resume`);
+		const { run, driver, disclosure } = entry;
+		const handle = run.handle;
+		handle.setStatus("running");
+		let outcome: Awaited<ReturnType<NonNullable<RuntimeDriver["resume"]>>>;
+		try {
+			outcome = await resumeDriver.call(driver, message);
+		} catch (error) {
+			outcome = { text: "", error: { kind: "model", message: error instanceof Error ? error.message : String(error) } };
+		}
+		entry.transcript = outcome.transcript ?? entry.transcript;
+		const result = outcome.error
+			? this.baseResult(run, outcome.error.kind === "aborted" ? "aborted" : "failed", outcome.text, outcome.error, disclosure, outcome.usage, undefined, outcome.sessionFile)
+			: (() => {
+				const resolved = resolveOutput(run.profile.output, outcome.text, outcome.submitted);
+				return this.baseResult(run, resolved.error ? "failed" : "completed", outcome.text, resolved.error, disclosure, outcome.usage, resolved.output, outcome.sessionFile);
+			})();
+		const event: DriverEvent = result.error ? { type: "failed", error: result.error.message } : { type: "completed" };
+		handle.emit(event);
+		entry.writer?.appendEvent(event);
+		if (entry.writer) {
+			try {
+				result.artifacts = { dir: entry.writer.dir, events: entry.writer.eventsPath, result: entry.writer.resultPath, ...(entry.transcript ? { transcript: entry.writer.transcriptPath } : {}) };
+				await entry.writer.finish(result, entry.transcript);
+			} catch (error) {
+				result.status = "failed";
+				result.error = { kind: "tool", message: `Artifact write failed: ${error instanceof Error ? error.message : String(error)}` };
+				delete result.artifacts;
+			}
+		}
+		handle.applyResume(result);
+		// A run stays resumable only while it remains completed; a failed follow-up closes the conversation.
+		if (result.status !== "completed") {
+			this.resumable.delete(id);
+			await driver.dispose?.();
+		}
+		return result;
 	}
 
 	private async abortQueued(run: QueuedRun): Promise<void> {
@@ -184,7 +247,7 @@ export class SubagentManager {
 				const status = outcome.error.kind === "aborted" ? "aborted" : "failed";
 				const result = this.baseResult(run, status, outcome.text, outcome.error, disclosure, outcome.usage, undefined, outcome.sessionFile);
 				emit(status === "aborted" ? { type: "aborted" } : { type: "failed", error: outcome.error.message });
-				await this.finish(run, result, writer, transcript, workspace);
+				await this.finish(run, result, writer, transcript, workspace, { driver, disclosure });
 				return;
 			}
 			const resolved = resolveOutput(profile.output, outcome.text, outcome.submitted);
@@ -199,7 +262,7 @@ export class SubagentManager {
 				outcome.sessionFile,
 			);
 			emit(resolved.error ? { type: "failed", error: resolved.error.message } : { type: "completed" });
-			await this.finish(run, result, writer, transcript, workspace);
+			await this.finish(run, result, writer, transcript, workspace, { driver, disclosure });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = handle.wasAbortRequested;
@@ -224,18 +287,28 @@ export class SubagentManager {
 		return { status, text, usage: { ...usage }, disclosure, ...(error ? { error } : {}), ...(output !== undefined ? { output } : {}), ...(sessionFile ? { sessionRef: { file: sessionFile } } : {}) };
 	}
 
-	private async finish(run: QueuedRun, result: SubagentResult, writer?: ArtifactWriter, transcript?: string, workspace?: ProvisionedWorkspace): Promise<void> {
-		await run.handle.disposeDriver();
+	private async finish(
+		run: QueuedRun,
+		result: SubagentResult,
+		writer?: ArtifactWriter,
+		transcript?: string,
+		workspace?: ProvisionedWorkspace,
+		resumeCtx?: { driver: RuntimeDriver; disclosure: SubagentDisclosure },
+	): Promise<void> {
+		let workspaceRetained = true;
 		if (workspace) {
-			const retained = run.options.workspace?.retain ?? true;
-			result.workspace = { path: workspace.cwd, retained };
-			if (!retained) {
-				try {
-					await workspace.cleanup();
-				} catch (error) {
-					result.status = "failed";
-					result.error = { kind: "tool", message: `Workspace cleanup failed: ${error instanceof Error ? error.message : String(error)}` };
-				}
+			workspaceRetained = run.options.workspace?.retain ?? true;
+			result.workspace = { path: workspace.cwd, retained: workspaceRetained };
+		}
+		// A completed run keeps its driver/session so it can be resumed; anything else releases the driver now.
+		const canResume = result.status === "completed" && !!resumeCtx?.driver.resume && workspaceRetained;
+		if (!canResume) await run.handle.disposeDriver();
+		if (workspace && !workspaceRetained) {
+			try {
+				await workspace.cleanup();
+			} catch (error) {
+				result.status = "failed";
+				result.error = { kind: "tool", message: `Workspace cleanup failed: ${error instanceof Error ? error.message : String(error)}` };
 			}
 		}
 		if (writer) {
@@ -246,6 +319,15 @@ export class SubagentManager {
 				result.status = "failed";
 				result.error = { kind: "tool", message: `Artifact write failed: ${error instanceof Error ? error.message : String(error)}` };
 				delete result.artifacts;
+			}
+		}
+		if (canResume && resumeCtx) {
+			// A late artifact/workspace failure can flip the status; only truly-completed runs stay resumable.
+			if (result.status === "completed") {
+				this.resumable.set(run.handle.id, { run, driver: resumeCtx.driver, disclosure: resumeCtx.disclosure, writer, transcript, workspace });
+				run.handle.setResume((message) => this.resume(run.handle.id, message));
+			} else {
+				await run.handle.disposeDriver();
 			}
 		}
 		run.handle.complete(result);

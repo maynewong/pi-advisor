@@ -1,5 +1,5 @@
 ---
-name: scout
+name: search
 description: Finds relevant files, symbols, and repository facts quickly
 tools: [read, grep, find, ls]
 contextMode: selected

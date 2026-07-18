@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { builtInAgentNames, createModelResolver, getBuiltInAgentPath, loadBuiltInAgent, oracleReportSchema } from "../src/index.ts";
-import {
+import subagentExtension, {
 	appendOracleGuidance,
 	contextForSubagent,
 	escalationDecision,
@@ -11,10 +11,26 @@ import {
 	oracleCommandPrompt,
 	oracleReportFromOutput,
 	resolveArtifactsDir,
+	roleToolSpecs,
 } from "../extensions/subagent.ts";
 import type { SubagentProfile } from "pi-subagent-core";
 
 const anyProfile = { name: "any" } as SubagentProfile;
+
+/** Minimal fake extension host that records the tools, commands, and lifecycle hooks the extension registers. */
+function captureRegistrations() {
+	const tools = new Map<string, { parameters: { required?: string[]; properties?: Record<string, unknown> }; description: string; label: string }>();
+	const commands = new Set<string>();
+	const events = new Set<string>();
+	const pi = {
+		on: (event: string) => { events.add(event); },
+		registerTool: (def: { name: string } & Record<string, unknown>) => { tools.set(def.name, def as never); },
+		registerCommand: (name: string) => { commands.add(name); },
+		sendUserMessage: () => {},
+	};
+	subagentExtension(pi as never);
+	return { tools, commands, events };
+}
 
 describe("built-in agents", () => {
 	test("ships loadable markdown profiles for every declared role", async () => {
@@ -204,5 +220,52 @@ describe("built-in agents", () => {
 		await expect(escalationDecision(allowUi, true, { tool: "bash", question: "run it?" })).resolves.toBe("allow");
 		await expect(escalationDecision(denyUi, true, { tool: "bash", question: "run it?" })).resolves.toBe("deny");
 		await expect(escalationDecision(never, false, { tool: "bash", question: "run it?" })).resolves.toBe("deny");
+	});
+});
+
+describe("dedicated per-role tools", () => {
+	test("exposes a dedicated tool for oracle, search, and reviewer but not worker", () => {
+		expect(roleToolSpecs.map((spec) => spec.name)).toEqual(["oracle", "search", "reviewer"]);
+		expect(roleToolSpecs.map((spec) => spec.name)).not.toContain("worker");
+	});
+
+	test("registers oracle/search/reviewer alongside the generic and send tools, with no dedicated worker tool", () => {
+		const { tools, commands } = captureRegistrations();
+		expect([...tools.keys()].sort()).toEqual(["oracle", "reviewer", "search", "subagent", "subagent_result", "subagent_send"].sort());
+		expect(tools.has("worker")).toBe(false);
+		expect(commands.has("subagents")).toBe(true);
+	});
+
+	test("no longer injects oracle guidance into the parent system prompt", () => {
+		// Guidance now lives in the dedicated oracle tool description, so the before_agent_start hook is gone.
+		expect(captureRegistrations().events.has("before_agent_start")).toBe(false);
+	});
+
+	test("carries the oracle consultation policy in the dedicated tool description", () => {
+		const oracle = captureRegistrations().tools.get("oracle")!;
+		expect(oracle.description).toContain("auth, billing, permissions, data migration, or a public API contract");
+		expect(oracle.description).toContain("Do not use Oracle for typo fixes");
+	});
+
+	test("keeps scoped implementation available through the generic tool loading the worker card", async () => {
+		const { tools } = captureRegistrations();
+		expect(tools.get("subagent")!.description).toMatch(/worker card/i);
+		// The worker card is still loadable even though it has no dedicated tool.
+		await expect(loadBuiltInAgent("worker")).resolves.toMatchObject({ name: "worker" });
+	});
+
+	test("defaults oracle and reviewer to include the working-tree diff, opting out on explicit false", () => {
+		const oracle = roleToolSpecs.find((spec) => spec.name === "oracle")!;
+		expect(oracle.toRunParams({ task: "t" }).includeDiff).toBe(true);
+		expect(oracle.toRunParams({ task: "t", includeDiff: false }).includeDiff).toBe(false);
+
+		const reviewer = roleToolSpecs.find((spec) => spec.name === "reviewer")!;
+		expect(reviewer.toRunParams({ task: "t" }).includeDiff).toBe(true);
+		expect(reviewer.toRunParams({ task: "t", includeDiff: false }).includeDiff).toBe(false);
+	});
+
+	test("gives search a lean read-only schema with neither includeDiff nor writeScope", () => {
+		const search = captureRegistrations().tools.get("search")!;
+		expect(Object.keys(search.parameters.properties ?? {})).toEqual(["task", "files", "background"]);
 	});
 });

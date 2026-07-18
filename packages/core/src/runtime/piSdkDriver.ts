@@ -16,7 +16,7 @@ import type { ModelSpec, SubagentProfile, UsageSnapshot } from "../types.ts";
 import { evaluatePermission } from "../permission/evaluatePermission.ts";
 import { PermissionEscalations } from "../permission/PermissionEscalations.ts";
 import type { ContextInput } from "../types.ts";
-import type { DriverRequest, RuntimeDriverFactory } from "./driver.ts";
+import type { DriverRequest, DriverRunResult, RuntimeDriverFactory } from "./driver.ts";
 import { describeToolCall, driverErrorFromMessages, resolveActiveTools, successfulFileEvent, thoughtPreview } from "./piSdkDriverSupport.ts";
 
 interface PiSdkDriverOptions {
@@ -173,28 +173,34 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 				}
 			}
 		});
+		// Reduce the current session state into a driver result; shared by the initial run and any resume turn.
+		const collect = (promptError: unknown): DriverRunResult => {
+			const error = request.profile.maxTurns && turns > request.profile.maxTurns
+				? { kind: "max_turns" as const, message: `Subagent exceeded maxTurns ${request.profile.maxTurns}` }
+				: promptError
+					? { kind: "model" as const, message: promptError instanceof Error ? promptError.message : String(promptError) }
+					: driverErrorFromMessages(session.messages);
+			return {
+				text: assistantText(session.messages),
+				...(error ? { error } : {}),
+				...(submitted !== undefined ? { submitted } : {}),
+				usage: usageFromMessages(session.messages),
+				transcript: JSON.stringify(session.messages, null, 2),
+				...(session.sessionFile ? { sessionFile: session.sessionFile } : {}),
+			};
+		};
+		const promptTurn = async (message: string): Promise<DriverRunResult> => {
+			let promptError: unknown;
+			try {
+				await session.prompt(message);
+			} catch (error) {
+				promptError = error;
+			}
+			return collect(promptError);
+		};
 		return {
-			async run() {
-				let promptError: unknown;
-				try {
-					await session.prompt(request.prompt);
-				} catch (error) {
-					promptError = error;
-				}
-				const error = request.profile.maxTurns && turns > request.profile.maxTurns
-					? { kind: "max_turns" as const, message: `Subagent exceeded maxTurns ${request.profile.maxTurns}` }
-					: promptError
-						? { kind: "model" as const, message: promptError instanceof Error ? promptError.message : String(promptError) }
-						: driverErrorFromMessages(session.messages);
-				return {
-					text: assistantText(session.messages),
-					...(error ? { error } : {}),
-					...(submitted !== undefined ? { submitted } : {}),
-					usage: usageFromMessages(session.messages),
-					transcript: JSON.stringify(session.messages, null, 2),
-					...(session.sessionFile ? { sessionFile: session.sessionFile } : {}),
-				};
-			},
+			run: () => promptTurn(request.prompt),
+			resume: (message) => promptTurn(message),
 			abort: () => session.abort(),
 			steer: (message) => session.steer(message),
 			followUp: (message) => session.followUp(message),

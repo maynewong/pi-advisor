@@ -7,7 +7,7 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import { loadProfileFile, type ModelSpec, type SubagentProfile } from "pi-subagent-core";
 
-export const builtInAgentNames = ["oracle", "worker", "scout", "reviewer"] as const;
+export const builtInAgentNames = ["oracle", "worker", "search", "reviewer"] as const;
 export type BuiltInAgentName = typeof builtInAgentNames[number];
 
 export const STRONG_REASONING_ALIAS = "strong-reasoning";

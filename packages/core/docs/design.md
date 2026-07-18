@@ -149,6 +149,7 @@ interface SubagentHandle {
   subscribe(listener: (event: SubagentEvent) => void): () => void;
   steer(message: string): void;
   followUp(message: string): void;
+  resume(message: string): Promise<SubagentResult>;
   abort(): Promise<void>;
   resolveEscalation(id: string, decision: "allow" | "deny"): boolean;
   wait(): Promise<SubagentResult>;
@@ -157,6 +158,18 @@ interface SubagentHandle {
 
 `wait()` always resolves with a terminal result. Runtime failures are data in
 the result rather than rejected promises.
+
+`steer` and `followUp` act on a run that is still active. `resume` acts after a
+terminal state: a **completed** run keeps its driver and session, so a
+supervisor can continue the conversation with a follow-up message and receive a
+new `SubagentResult` (the manager also exposes `resume(id, message)`). Resuming
+runs another turn on the retained session, accumulates disclosure, and rewrites
+the run's `result.json` while appending to `events.jsonl`. Consistent with the
+result-as-data philosophy, a failed follow-up turn is returned as a failed
+result — and closes the run to further resumes — rather than throwing. Only
+completed runs are resumable; aborted, timed-out, and failed runs release their
+driver on termination. The already resolved `wait()` promise is not re-armed;
+the new result arrives through `resume`'s own promise.
 
 ### 4.5 Events
 
@@ -256,7 +269,7 @@ tool selection and, where needed, workspace or container boundaries.
 
 | Mode | Behavior | Typical use |
 | --- | --- | --- |
-| `fresh` | Start an independent in-memory session with the task. | Scout, Oracle |
+| `fresh` | Start an independent in-memory session with the task. | Search, Oracle |
 | `selected` | Build a bounded context packet from explicit files, diffs, and text. | Review, focused investigation |
 | `fork` | Fork an explicit parent session file and optional entry. | Continuation with inherited conversation context |
 
@@ -356,9 +369,19 @@ decisions.
 
 `pi-subagent-ux` owns host-facing integration:
 
-- The `subagent` tool
+- Dedicated per-role tools `oracle`, `search`, and `reviewer`, each with a
+  tailored description and a minimal role-appropriate parameter schema. They are
+  the primary trigger surface and all share one spawn/render implementation.
+- A generic `subagent` tool for custom profile `.md` paths (for example the
+  bundled `worker` card for scoped implementation). It still accepts any
+  built-in name.
+- The `subagent_result` tool for fetching background runs, and the
+  `subagent_send` tool for follow-up conversation: a running run is redirected
+  (steered) mid-flight, while a completed run is continued via the core
+  `resume` path and returns a new result.
 - The `/subagents` command
-- Built-in Oracle, Worker, Scout, and Reviewer profiles
+- Built-in Oracle, Search, Reviewer, and Worker profile cards (Worker ships as a
+  loadable card without a dedicated tool)
 - Streaming progress projection
 - Host UI notifications
 
@@ -372,7 +395,7 @@ The current implementation includes:
 
 - Manager and observable handles
 - Global and credential-key concurrency limits
-- Timeout, abort, steering, and follow-up
+- Timeout, abort, steering, follow-up, and resuming a completed run
 - Fresh, selected, and fork contexts
 - Permission blocking and supervisor escalation
 - Text and schema outputs
