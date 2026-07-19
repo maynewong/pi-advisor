@@ -30,17 +30,22 @@ import {
 	buildRoutingTable,
 	createModelResolver,
 	DEFAULT_MODE,
+	filterPoolSize,
 	isModelAlias,
 	loadBuiltInAgent,
 	MODE_ROUTING_TABLE,
+	MODEL_TIERS,
 	oracleReportSchema,
 	PARENT_MODE_ENTRY,
 	resolveAlias,
+	resolveStrongestOverall,
 	sameModel,
 	SUBAGENT_MODES,
 	type BuiltInAgentName,
+	type ModelResolverOptions,
 	type ResolvedRoleRouting,
 	type SubagentMode,
+	type TierRule,
 } from "../src/index.ts";
 
 // Shared parameter fragments so the generic tool and the per-role tools describe identical fields identically.
@@ -205,6 +210,12 @@ export interface SubagentUserConfig {
 	artifactsDir?: string;
 	retentionDays?: number;
 	maxRuns?: number;
+	/** Keyword filter narrowing the alias candidate pool (provider/id substring match). */
+	modelFilter?: string | string[];
+	/** User tier rules, prepended to the built-in priors (first match wins). */
+	tiers?: TierRule[];
+	/** Exact model for the parent session in BOTH modes, overriding the parent alias (thinking still mode-driven). */
+	parentModel?: string;
 }
 
 export interface OracleReportView {
@@ -274,7 +285,39 @@ export async function loadSubagentConfig(agentDir = getAgentDir()): Promise<Suba
 	validateNonNegativeNumber(root.maxRuns, path, "maxRuns");
 	if (root.retentionDays !== undefined) config.retentionDays = root.retentionDays as number;
 	if (root.maxRuns !== undefined) config.maxRuns = root.maxRuns as number;
+	if (root.modelFilter !== undefined) config.modelFilter = validateModelFilter(root.modelFilter, path);
+	if (root.tiers !== undefined) config.tiers = validateTiers(root.tiers, path);
+	if (root.parentModel !== undefined) {
+		if (typeof root.parentModel !== "string" || !root.parentModel.trim()) throw new Error(`Invalid ${path}: parentModel must be a non-empty string`);
+		config.parentModel = root.parentModel;
+	}
 	return config;
+}
+
+/** Validate `modelFilter`: a non-empty string or a non-empty array of non-empty strings. */
+function validateModelFilter(value: unknown, path: string): string | string[] {
+	if (typeof value === "string") {
+		if (!value.trim()) throw new Error(`Invalid ${path}: modelFilter must be a non-empty string`);
+		return value;
+	}
+	if (Array.isArray(value) && value.length > 0 && value.every((keyword) => typeof keyword === "string" && keyword.trim())) {
+		return value as string[];
+	}
+	throw new Error(`Invalid ${path}: modelFilter must be a non-empty string or array of non-empty strings`);
+}
+
+/** Validate `tiers`: an array of `{ pattern: non-empty string, tier: strong|mid|fast }`. */
+function validateTiers(value: unknown, path: string): TierRule[] {
+	if (!Array.isArray(value)) throw new Error(`Invalid ${path}: tiers must be an array`);
+	return value.map((rule) => {
+		if (!rule || typeof rule !== "object" || Array.isArray(rule)) throw new Error(`Invalid ${path}: tiers entries must be objects`);
+		const { pattern, tier } = rule as Record<string, unknown>;
+		if (typeof pattern !== "string" || !pattern.trim()) throw new Error(`Invalid ${path}: tiers[].pattern must be a non-empty string`);
+		if (typeof tier !== "string" || !(MODEL_TIERS as readonly string[]).includes(tier)) {
+			throw new Error(`Invalid ${path}: tiers[].tier must be one of ${MODEL_TIERS.join(", ")}`);
+		}
+		return { pattern, tier } as TierRule;
+	});
 }
 
 /** Persist the effort mode into subagent-kit.json, preserving all other fields and their values. */
@@ -288,6 +331,22 @@ export async function persistMode(mode: SubagentMode, agentDir = getAgentDir()):
 		if (!isMissingFile(error)) throw error;
 	}
 	root.mode = mode;
+	await mkdir(agentDir, { recursive: true });
+	await writeFile(path, `${JSON.stringify(root, null, 2)}\n`, "utf8");
+}
+
+/** Set or clear the `modelFilter` in subagent-kit.json, preserving all other fields. `undefined` removes it. */
+export async function persistModelFilter(filter: string | string[] | undefined, agentDir = getAgentDir()): Promise<void> {
+	const path = join(agentDir, MODEL_CONFIG_FILE);
+	let root: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(await readFile(path, "utf8"));
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) root = parsed as Record<string, unknown>;
+	} catch (error) {
+		if (!isMissingFile(error)) throw error;
+	}
+	if (filter === undefined) delete root.modelFilter;
+	else root.modelFilter = filter;
 	await mkdir(agentDir, { recursive: true });
 	await writeFile(path, `${JSON.stringify(root, null, 2)}\n`, "utf8");
 }
@@ -344,10 +403,27 @@ async function applyParentMode(
 	pi: Pick<ExtensionAPI, "setModel" | "setThinkingLevel">,
 	mode: SubagentMode,
 	ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
+	config: Pick<SubagentUserConfig, "parentModel" | "modelFilter" | "tiers">,
 ): Promise<string> {
 	const entry = PARENT_MODE_ENTRY[mode];
 	pi.setThinkingLevel(entry.thinkingLevel);
-	const outcome = resolveAlias(entry.model, { registry: ctx.modelRegistry, parentModel: ctx.model });
+	// A `parentModel` config override pins the exact model for the parent in both modes (thinking still mode-driven).
+	if (config.parentModel) {
+		const matches = findRegistryModels(ctx.modelRegistry, config.parentModel);
+		const label = `${config.parentModel} (manual override)`;
+		if (matches.length === 0) return `parent → thinking ${entry.thinkingLevel} (parentModel ${config.parentModel} not available in the registry)`;
+		if (matches.length > 1) {
+			return `parent → thinking ${entry.thinkingLevel} (parentModel ${config.parentModel} is ambiguous: ${matches.map((model) => `${model.provider}/${model.id}`).join(", ")})`;
+		}
+		const target = matches[0];
+		if (ctx.model && sameModel(target, ctx.model)) return `parent → ${label} · thinking ${entry.thinkingLevel} (model unchanged)`;
+		const ok = await pi.setModel(target);
+		return ok
+			? `parent → ${label} · thinking ${entry.thinkingLevel}`
+			: `parent → thinking ${entry.thinkingLevel} (model switch to ${label} unavailable: no API key)`;
+	}
+	const aliasOptions = { registry: ctx.modelRegistry, parentModel: ctx.model, modelFilter: config.modelFilter, userTiers: config.tiers };
+	const outcome = mode === "medium" ? resolveStrongestOverall(aliasOptions) : resolveAlias(entry.model, aliasOptions);
 	const target = outcome.model;
 	if (target && (!ctx.model || !sameModel(target, ctx.model))) {
 		const ok = await pi.setModel(target);
@@ -356,6 +432,18 @@ async function applyParentMode(
 			: `parent → thinking ${entry.thinkingLevel} (model switch to ${outcome.modelId} unavailable: no API key)`;
 	}
 	return `parent → ${outcome.modelId ?? ctx.model?.id ?? "unchanged"} · thinking ${entry.thinkingLevel} (model unchanged)`;
+}
+
+/** Find exact registry models by `provider/id` or bare id/name, preserving ambiguity for the caller. */
+function findRegistryModels(registry: Pick<ExtensionContext["modelRegistry"], "getAvailable">, target: string) {
+	const available = registry.getAvailable();
+	const slash = target.indexOf("/");
+	if (slash > 0) {
+		const provider = target.slice(0, slash);
+		const id = target.slice(slash + 1);
+		return available.filter((model) => model.provider === provider && model.id === id);
+	}
+	return available.filter((model) => model.id === target || model.name === target);
 }
 
 /** Resolve the per-project artifacts bucket, honoring an explicit override relative to cwd. */
@@ -702,14 +790,28 @@ function renderRunResult(
 }
 
 export default function subagentExtension(pi: ExtensionAPI) {
-	const managers = new Map<string, { manager: SubagentManager; artifactsDir: string }>();
+	const managers = new Map<string, { manager: SubagentManager; artifactsDir: string; resolverOptions: ModelResolverOptions }>();
 	const trackedRuns = new Map<string, TrackedRun>();
 
 	const getManager = (ctx: ExtensionContext, config: SubagentUserConfig): { manager: SubagentManager; artifactsDir: string } => {
 		const existing = managers.get(ctx.cwd);
-		if (existing) return existing;
+		if (existing) {
+			Object.assign(existing.resolverOptions, {
+				registry: ctx.modelRegistry,
+				parentModel: ctx.model,
+				modelFilter: config.modelFilter,
+				userTiers: config.tiers,
+			});
+			return existing;
+		}
 		const artifactsDir = resolveArtifactsDir(ctx.cwd, config.artifactsDir);
-		const resolveModelFn = createModelResolver({ registry: ctx.modelRegistry, parentModel: ctx.model });
+		const resolverOptions: ModelResolverOptions = {
+			registry: ctx.modelRegistry,
+			parentModel: ctx.model,
+			modelFilter: config.modelFilter,
+			userTiers: config.tiers,
+		};
+		const resolveModelFn = createModelResolver(resolverOptions);
 		const manager = new SubagentManager({
 			cwd: ctx.cwd,
 			authStorage: ctx.modelRegistry.authStorage,
@@ -717,7 +819,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			resolveModel: resolveModelFn,
 			artifactsDir,
 		});
-		const entry = { manager, artifactsDir };
+		const entry = { manager, artifactsDir, resolverOptions };
 		managers.set(ctx.cwd, entry);
 		// Lazy retention: fire-and-forget prune of this project's bucket; never fail a spawn on cleanup errors.
 		void pruneSubagentRuns(artifactsDir, {
@@ -840,16 +942,21 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		// Mode routing: a role's mode entry sets its model alias, thinking level, and turn budget.
 		// A manual `agents.<role>.model` override beats the table's alias; explicit per-run maxTurns beats it too.
 		const overrides: Partial<SubagentProfile> = {};
+		const aliasOptions = { registry: ctx.modelRegistry, parentModel: ctx.model, modelFilter: config.modelFilter, userTiers: config.tiers };
 		const configuredModel = config.agents[profile.name]?.model;
 		const mode = config.mode ?? DEFAULT_MODE;
 		const modeEntry = MODE_ROUTING_TABLE[profile.name]?.[mode];
 		let degradedNote: string | undefined;
 		if (modeEntry) {
-			overrides.model = configuredModel ?? modeEntry.model;
 			overrides.thinkingLevel = modeEntry.thinkingLevel;
 			if (modeEntry.maxTurns !== undefined) overrides.maxTurns = modeEntry.maxTurns;
-			if (!configuredModel) {
-				const outcome = resolveAlias(modeEntry.model, { registry: ctx.modelRegistry, parentModel: ctx.model });
+			if (configuredModel) {
+				// A manual per-role override beats the alias and bypasses the keyword filter entirely.
+				overrides.model = configuredModel;
+			} else {
+				// Resolve the alias here with the freshest filter/tiers config so the pick reflects the current /mode filter.
+				const outcome = resolveAlias(modeEntry.model, aliasOptions);
+				overrides.model = outcome.model ?? modeEntry.model;
 				if (outcome.degraded) {
 					degradedNote = `⚠ ${profile.name} → ${outcome.modelId ?? "parent model"} · ${outcome.degradedReason ?? outcome.reason}`;
 				}
@@ -1043,32 +1150,58 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("mode", {
-		description: "Show or switch the subagent effort mode (low|medium) and print the resolved routing table",
+		description: "Show/switch subagent effort mode (low|medium), the model keyword filter (filter <kw>|off), and print the resolved table",
 		handler: async (args, ctx) => {
-			const arg = args.trim().toLowerCase();
-			if (arg && !(SUBAGENT_MODES as readonly string[]).includes(arg)) {
-				if (ctx.hasUI) ctx.ui.notify(`Usage: /mode [${SUBAGENT_MODES.join("|")}]`, "error");
-				return;
-			}
+			const parts = args.trim().split(/\s+/).filter(Boolean);
 			let config = await loadSubagentConfig();
 			let parentNote: string | undefined;
-			if (arg === "low" || arg === "medium") {
-				await persistMode(arg);
-				config = { ...config, mode: arg };
-				parentNote = await applyParentMode(pi, arg, ctx);
+
+			// `/mode filter <keyword>` narrows the alias candidate pool; `/mode filter off` clears it.
+			if (parts[0]?.toLowerCase() === "filter") {
+				const keyword = parts.slice(1).join(" ").trim();
+				if (!keyword) {
+					if (ctx.hasUI) ctx.ui.notify("Usage: /mode filter <keyword> | /mode filter off", "error");
+					return;
+				}
+				if (keyword.toLowerCase() === "off") {
+					await persistModelFilter(undefined);
+					config = { ...config, modelFilter: undefined };
+				} else {
+					await persistModelFilter(keyword);
+					config = { ...config, modelFilter: keyword };
+				}
+			} else {
+				const arg = parts[0]?.toLowerCase() ?? "";
+				if (arg && !(SUBAGENT_MODES as readonly string[]).includes(arg)) {
+					if (ctx.hasUI) ctx.ui.notify(`Usage: /mode [${SUBAGENT_MODES.join("|")}] | /mode filter <keyword>|off`, "error");
+					return;
+				}
+				if (arg === "low" || arg === "medium") {
+					await persistMode(arg);
+					config = { ...config, mode: arg };
+					parentNote = await applyParentMode(pi, arg, ctx, config);
+				}
 			}
+
 			const mode = config.mode ?? DEFAULT_MODE;
 			const rows = buildRoutingTable(mode, {
 				registry: ctx.modelRegistry,
 				parentModel: ctx.model,
 				manualOverrides: config.agents,
+				modelFilter: config.modelFilter,
+				userTiers: config.tiers,
 			});
+			const pool = filterPoolSize({ registry: ctx.modelRegistry, modelFilter: config.modelFilter });
+			const poolLine = pool.keywords.length
+				? `pool: ${pool.matched} of ${pool.total} models (filter: ${pool.keywords.join(", ")})`
+				: `pool: ${pool.total} models (no filter)`;
 			const lines = [
 				`Subagent mode: ${mode}${config.mode ? "" : " (default)"}`,
+				poolLine,
 				...rows.map(formatRoutingRow),
 				...(parentNote ? [parentNote] : []),
 				"",
-				"/mode retunes the parent session's model & thinking level too. Per-role escape hatch: agents.<role>.model in subagent-kit.json.",
+				"/mode retunes the parent session's model & thinking level too. Escape hatches in subagent-kit.json: agents.<role>.model, modelFilter, tiers, parentModel.",
 			];
 			if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
 		},

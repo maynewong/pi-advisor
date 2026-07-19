@@ -48,6 +48,9 @@ User-scoped settings live in `~/.pi/agent/subagent-kit.json` (or the agent direc
 {
   "mode": "medium",
   "agents": { "oracle": { "model": "gpt-5.5" } },
+  "modelFilter": "openrouter",
+  "tiers": [{ "pattern": "terra", "tier": "fast" }],
+  "parentModel": "openrouter/openai/gpt-5.5",
   "oracleGuidance": true,
   "artifactsDir": "./.pi/subagent-runs",
   "retentionDays": 14,
@@ -56,7 +59,10 @@ User-scoped settings live in `~/.pi/agent/subagent-kit.json` (or the agent direc
 ```
 
 - `mode` — effort knob, `"low"` or `"medium"` (default `"medium"`). See [Mode & model routing](#mode--model-routing).
-- `agents.<name>.model` — per-agent model override and the escape hatch that **beats the routing table**. A bare model ID or name must match exactly one authenticated model; use `provider/model-id` to disambiguate. An unavailable or ambiguous target fails the run. Unconfigured agents follow the mode routing table (alias resolution with a parent-model fallback). Model resolution runs through core's injected `resolveModel` (`createModelResolver`, exported for third-party hosts).
+- `agents.<name>.model` — per-agent model override and the escape hatch that **beats the routing table** (and **bypasses `modelFilter`**). A bare model ID or name must match exactly one authenticated model; use `provider/model-id` to disambiguate. An unavailable or ambiguous target fails the run. Unconfigured agents follow the mode routing table (alias resolution with a parent-model fallback). Model resolution runs through core's injected `resolveModel` (`createModelResolver`, exported for third-party hosts).
+- `modelFilter` — a case-insensitive keyword (or array of keywords) matched as a substring against each model's `provider`, `id`, and `provider/id`. When set, **only matching models form the candidate pool** for alias resolution — the way to keep routing on your cloud providers (e.g. `"openrouter"`) instead of a mixed registry that includes free local models. Manual `agents.<role>.model` overrides bypass it. If a filter matches **zero** models, resolution falls back to the unfiltered pool and the outcome is marked **degraded** (`modelFilter matched no models`) rather than silently ignored. Set/clear it live with `/mode filter <keyword>` / `/mode filter off`.
+- `tiers` — user tier rules, each `{ "pattern": <id substring>, "tier": "strong" | "mid" | "fast" }`. They are **prepended** to the built-in prior table (`MODEL_TIER_PRIORS`) at resolution time, so a user rule wins over the built-ins and earlier user rules win over later ones (first match wins). This is the escape hatch for models the built-in table doesn't name. Worked example: with `[{ "pattern": "terra", "tier": "fast" }]`, a model id containing `terra` is treated as fast-tier and becomes eligible for `fast-search`.
+- `parentModel` — an exact model (bare id or `provider/model-id`) for the **parent session** in both modes, overriding the parent alias. Thinking level is still driven by the mode. Shown in `/mode` with a `(manual override)` marker. If the id isn't in the registry the parent model is left unchanged.
 - `oracleGuidance` — accepted for backwards compatibility but no longer has any effect. The Oracle consultation policy now lives in the dedicated `oracle` tool description instead of being injected into the parent system prompt.
 - `artifactsDir` — override the artifacts location (relative paths resolve against cwd). By default runs are stored globally under `<agentDir>/subagent-runs/<project-slug>-<hash>`, so they no longer clutter the project tree.
 - `retentionDays` / `maxRuns` — lazy retention. On first use per project, run directories older than `retentionDays` are pruned (0 disables age pruning), then the newest survivors are trimmed to `maxRuns`. Cleanup never fails a spawn.
@@ -65,11 +71,13 @@ User-scoped settings live in `~/.pi/agent/subagent-kit.json` (or the agent direc
 
 Each built-in role resolves its model through a two-mode routing table (`low` | `medium`, default `medium`). A mode entry is `{ model alias, thinkingLevel, maxTurns? }`, so effort stays real even when the model pool is shallow: if every alias collapses to the same model, `low` and `medium` still differ by thinking level and turn budget. Turn budgets are **soft** (see [Soft turn budget](#soft-turn-budget)), so they are set to generous "background insurance" values a normal run rarely reaches: search `8`/`12`, reviewer `8`/`12`, worker `12`/`16`, and oracle a generous `16` in both modes (oracle is a few-turn, heavy-thinking role, so its budget is only a backstop, never a daily constraint).
 
-Aliases resolve against the **actual** authenticated model registry, scored on registry metadata (cost, context window, reasoning support) plus a small, editable prior table mapping known model-id substrings to coarse tiers (`gpt-5*`/`o*`/`opus`/`fable` → strong; `glm`/`deepseek`/`qwen`/`sonnet` → mid; `*-air`/`*flash`/`*mini`/`haiku` → fast). The tables are exported (`MODEL_TIER_PRIORS`, `MODEL_FAMILY_PRIORS`) and easy to edit.
+Aliases resolve against the **actual** authenticated model registry (optionally narrowed by `modelFilter`), scored on registry metadata (cost, context window, reasoning support) plus a small, editable prior table mapping known model-id substrings to coarse tiers (`gpt-5*`/`o*`/`opus`/`fable` → strong; `glm`/`deepseek`/`qwen`/`kimi`/`sonnet` → mid; `*-air`/`*flash`/`*mini`/`haiku`/`turbo`/`highspeed` → fast). The tables are exported (`MODEL_TIER_PRIORS`, `MODEL_FAMILY_PRIORS`) and easy to edit; the `tiers` config prepends your own rules without touching the source.
 
 - `strong-reasoning` (oracle) — the strongest model from a **different** provider/family than the parent (a heterogeneous second opinion); if none, the strongest overall; if that is the parent itself, it falls back to the parent and is flagged **degraded** (oracle then runs with half its value: independent context only, no independent model).
-- `fast-search` (search) — the cheapest/fastest qualifying model.
+- `fast-search` (search) — **tier-first, cost-second**: among fast-tier models it takes the cheapest **non-zero-cost** one; if no fast tier exists it falls back to the cheapest mid-tier model; only as a last resort does it pick a zero-cost/unknown model, and that outcome is flagged **degraded** (`only free/local models available for fast-search — quality unknown`).
 - `balanced` (reviewer, worker) — a mid-tier model.
+
+**Free-local-model guard.** A `$0`-cost model whose tier is only a metadata guess (no id prior matched) is never treated as a qualified pick — *free is not a qualification*. Such a model can never win a scored alias over a prior-matched model, and a nonzero-cost fast model is always preferred over a zero-cost local one for `fast-search`. This is why a mixed registry (paid cloud models + a free 4-bit local model) no longer routes `search` to the local model just because it is the raw-cheapest. Give a local model a real tier with a `tiers` rule to make it eligible.
 
 Per-role sensitivity guidance: **search** and **reviewer** work fine on weak/cheap models — routing them to a fast or mid model is the whole point of `low` mode. **Oracle** is the one role worth a paid strong-model key: a degraded oracle gives you only an independent context, not an independent stronger reasoner. Set `agents.oracle.model` to force a specific strong model.
 
@@ -77,10 +85,11 @@ Every resolution produces a structured outcome (`{ alias, modelId, reason, degra
 
 ### `/mode`
 
-- `/mode` — print the current resolved routing table: one line per role showing resolved model id, thinking level, and turn budget, with a `⚠` marker and explanation on degraded rows.
+- `/mode` — print the current resolved routing table: a pool line (`pool: 6 of 14 models (filter: openrouter)` when a filter is active, otherwise `pool: 14 models (no filter)`) followed by one line per role showing resolved model id, thinking level, and turn budget, with a `⚠` marker and explanation on degraded rows.
 - `/mode low` / `/mode medium` — persist the mode into `subagent-kit.json` (other fields preserved) and reprint the table.
+- `/mode filter <keyword>` / `/mode filter off` — set or clear `modelFilter` (persisted, other fields preserved) and reprint the table with the new pool.
 
-Because the Pi extension API exposes `setModel`/`setThinkingLevel`, `/mode low|medium` also **retunes the parent session** per a `balanced` parent entry (mid-tier model + mode-appropriate thinking level). A manual `agents.<role>.model` override always beats the table for that role.
+Because the Pi extension API exposes `setModel`/`setThinkingLevel`, `/mode low|medium` also **retunes the parent session**, mirroring Amp's mode tiers: `medium` runs the parent on the **strong** model (like Amp's medium tier), `low` runs it on a **mid-tier** model, both at medium thinking. A `parentModel` config override pins an exact parent model in both modes (shown with a `(manual override)` marker). A manual `agents.<role>.model` override always beats the table for that role.
 
 ## Oracle workflow
 

@@ -44,6 +44,24 @@ describe("SubagentManager", () => {
 		expect(manager.get(handle.id)).toBe(handle);
 	});
 
+	test("updates handle usage while the child is still running", async () => {
+		const finish = deferred<{ text: string; usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number } }>();
+		const liveUsage = { input: 1200, output: 300, cacheRead: 50, cacheWrite: 0, cost: 0.0123, turns: 1 };
+		const factory: RuntimeDriverFactory = async (_request, emit) => ({
+			async run() {
+				emit({ type: "usage", usage: liveUsage });
+				return finish.promise;
+			},
+			async abort() {},
+		});
+		const handle = new SubagentManager({ cwd: "/repo", createDriver: factory }).spawn(PROFILE, "Track live cost");
+
+		await vi.waitFor(() => expect(handle.usage).toEqual(liveUsage));
+		expect(handle.status).toBe("running");
+		finish.resolve({ text: "done", usage: liveUsage });
+		await handle.wait();
+	});
+
 	test("queues children above the concurrency limit", async () => {
 		const first = deferred<{ text: string }>();
 		const second = deferred<{ text: string }>();

@@ -7,11 +7,12 @@ import {
 	effectiveTier,
 	MODE_ROUTING_TABLE,
 	modelFamily,
+	PARENT_MODE_ENTRY,
 	resolveAlias,
 	resolveRoleRouting,
 	SUBAGENT_MODES,
 } from "../src/index.ts";
-import subagentExtension, { loadSubagentConfig, persistMode } from "../extensions/subagent.ts";
+import subagentExtension, { loadSubagentConfig, persistMode, persistModelFilter } from "../extensions/subagent.ts";
 
 /** Build a fake registry model with just the fields the resolver reads; everything else is filler. */
 function model(partial: Partial<{ provider: string; id: string; name: string; reasoning: boolean; contextWindow: number; input: number; output: number }>): never {
@@ -38,6 +39,12 @@ const gpt5 = model({ provider: "openai", id: "gpt-5.5", reasoning: true, input: 
 const glm = model({ provider: "zhipu", id: "glm-4.6", reasoning: true, input: 3, output: 6 });
 const haiku = model({ provider: "anthropic", id: "claude-3-5-haiku", input: 0.8, output: 4 });
 const fableParent = model({ provider: "anthropic", id: "claude-fable", reasoning: true, input: 15, output: 75 });
+// A free 4-bit local model with an id no built-in prior names: $0 cost, big context, reasoning — attractive to
+// raw-cheapest logic and to metadata-only tiering, but unqualified (its tier is a metadata guess, not a prior).
+const localFree = model({ provider: "omlx", id: "local-oss-4bit", reasoning: true, contextWindow: 262144, input: 0, output: 0 });
+// A cloud router slice used for keyword-filter tests.
+const openrouterStrong = model({ provider: "openrouter", id: "openai/gpt-5.5", reasoning: true, input: 12, output: 48 });
+const openrouterFast = model({ provider: "openrouter", id: "openai/gpt-5.5-mini", input: 0.4, output: 1.6 });
 
 describe("mode routing table", () => {
 	test("keeps oracle at strong-reasoning + high thinking in BOTH modes (never degrades)", () => {
@@ -68,6 +75,11 @@ describe("mode routing table", () => {
 		// Oracle is few-turn/heavy-thinking: its budget is background insurance only, never a daily constraint.
 		expect(MODE_ROUTING_TABLE.oracle.low.maxTurns).toBe(16);
 		expect(MODE_ROUTING_TABLE.oracle.medium.maxTurns).toBe(16);
+	});
+
+	test("mirrors Amp's parent tiers: low on a mid-tier model, medium on the strong model, both at medium thinking", () => {
+		expect(PARENT_MODE_ENTRY.low).toEqual({ model: "balanced", thinkingLevel: "medium" });
+		expect(PARENT_MODE_ENTRY.medium).toEqual({ model: "strong-reasoning", thinkingLevel: "medium" });
 	});
 });
 
@@ -107,6 +119,59 @@ describe("auto model resolver", () => {
 		const outcome = resolveAlias("balanced", { registry: registryOf(gpt5, glm, haiku), parentModel: gpt5 });
 		expect(outcome.modelId).toBe("zhipu/glm-4.6");
 		expect(outcome.degraded).toBe(false);
+	});
+
+	test("balanced excludes an unqualified free model from its median-cost fallback", () => {
+		const outcome = resolveAlias("balanced", { registry: registryOf(gpt5, localFree), parentModel: fableParent });
+		expect(outcome.modelId).toBe("openai/gpt-5.5");
+		expect(outcome.degraded).toBe(false);
+	});
+
+	test("fast-search prefers a nonzero-cost fast model over a $0 local model (free is not a qualification)", () => {
+		// The $0 local model is the raw-cheapest; fast-search must still pick the priced fast-tier Haiku.
+		const outcome = resolveAlias("fast-search", { registry: registryOf(gpt5, haiku, localFree), parentModel: gpt5 });
+		expect(outcome.modelId).toBe("anthropic/claude-3-5-haiku");
+		expect(outcome.degraded).toBe(false);
+	});
+
+	test("fast-search falls back to a mid-tier model when no fast tier exists, then flags a free-only pool as degraded", () => {
+		// No fast tier: fall to the cheapest priced mid-tier model.
+		const midOnly = resolveAlias("fast-search", { registry: registryOf(gpt5, glm), parentModel: gpt5 });
+		expect(midOnly.modelId).toBe("zhipu/glm-4.6");
+		expect(midOnly.degraded).toBe(false);
+		// Only free/local models: pick one but mark the outcome degraded (quality unknown).
+		const freeOnly = resolveAlias("fast-search", { registry: registryOf(localFree), parentModel: gpt5 });
+		expect(freeOnly.modelId).toBe("omlx/local-oss-4bit");
+		expect(freeOnly.degraded).toBe(true);
+		expect(freeOnly.degradedReason).toMatch(/only free\/local models available for fast-search/i);
+	});
+
+	test("a $0 metadata-only model never beats a prior-matched model for strong-reasoning", () => {
+		// localFree is $0 with a big reasoning context but has no id prior; the prior-matched Haiku must win.
+		const outcome = resolveAlias("strong-reasoning", { registry: registryOf(haiku, localFree), parentModel: fableParent });
+		expect(outcome.modelId).toBe("anthropic/claude-3-5-haiku");
+	});
+
+	test("a user tier rule reclassifies a model and wins over the built-in table", () => {
+		// glm is 'mid' by the built-in table; a user rule promotes it to 'strong'.
+		const userTiers = [{ pattern: "glm", tier: "strong" as const }];
+		expect(effectiveTier(glm, userTiers)).toBe("strong");
+		const outcome = resolveAlias("strong-reasoning", { registry: registryOf(glm, haiku), parentModel: fableParent, userTiers });
+		expect(outcome.modelId).toBe("zhipu/glm-4.6");
+	});
+
+	test("modelFilter narrows the candidate pool to matching models", () => {
+		// Only the OpenRouter models pass the filter, so the free local model and Claude are excluded.
+		const outcome = resolveAlias("fast-search", { registry: registryOf(openrouterStrong, openrouterFast, haiku, localFree), parentModel: fableParent, modelFilter: "openrouter" });
+		expect(outcome.modelId).toBe("openrouter/openai/gpt-5.5-mini");
+		expect(outcome.degraded).toBe(false);
+	});
+
+	test("a modelFilter that matches nothing falls back to the whole pool and marks the outcome degraded", () => {
+		const outcome = resolveAlias("balanced", { registry: registryOf(gpt5, glm, haiku), parentModel: gpt5, modelFilter: "nonesuch" });
+		expect(outcome.modelId).toBe("zhipu/glm-4.6");
+		expect(outcome.degraded).toBe(true);
+		expect(outcome.degradedReason).toMatch(/modelFilter matched no models/i);
 	});
 });
 
@@ -150,6 +215,36 @@ describe("mode config + /mode command", () => {
 
 		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ mode: "turbo" }));
 		await expect(loadSubagentConfig(dir)).rejects.toThrow(/mode must be one of low, medium/i);
+	});
+
+	test("validates modelFilter and tiers config", async () => {
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ modelFilter: "openrouter", tiers: [{ pattern: "terra", tier: "fast" }] }));
+		await expect(loadSubagentConfig(dir)).resolves.toEqual({ agents: {}, modelFilter: "openrouter", tiers: [{ pattern: "terra", tier: "fast" }] });
+
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ modelFilter: "" }));
+		await expect(loadSubagentConfig(dir)).rejects.toThrow(/modelFilter must be a non-empty string/i);
+
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ tiers: [{ pattern: "x", tier: "blazing" }] }));
+		await expect(loadSubagentConfig(dir)).rejects.toThrow(/tiers\[\].tier must be one of strong, mid, fast/i);
+
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ tiers: [{ tier: "fast" }] }));
+		await expect(loadSubagentConfig(dir)).rejects.toThrow(/tiers\[\].pattern must be a non-empty string/i);
+	});
+
+	test("validates the parentModel override as a non-empty string", async () => {
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ parentModel: "openrouter/openai/gpt-5.5" }));
+		await expect(loadSubagentConfig(dir)).resolves.toEqual({ agents: {}, parentModel: "openrouter/openai/gpt-5.5" });
+
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ parentModel: 5 }));
+		await expect(loadSubagentConfig(dir)).rejects.toThrow(/parentModel must be a non-empty string/i);
+	});
+
+	test("persistModelFilter sets and clears the filter while preserving other fields", async () => {
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ agents: {}, mode: "low" }));
+		await persistModelFilter("openrouter", dir);
+		expect(JSON.parse(await readFile(join(dir, "subagent-kit.json"), "utf8"))).toEqual({ agents: {}, mode: "low", modelFilter: "openrouter" });
+		await persistModelFilter(undefined, dir);
+		expect(JSON.parse(await readFile(join(dir, "subagent-kit.json"), "utf8"))).toEqual({ agents: {}, mode: "low" });
 	});
 
 	test("persistMode writes the mode while preserving other fields", async () => {
@@ -200,8 +295,8 @@ describe("mode config + /mode command", () => {
 		expect(notices[0]).toContain("Subagent mode: low");
 		expect(notices[0]).toContain("oracle → openai/gpt-5.5");
 		expect(notices[0]).toContain("search → anthropic/claude-3-5-haiku");
-		// Retuned the parent session.
-		expect(setThinkingCalls).toEqual(["low"]);
+		// Retuned the parent session. Low mode runs the parent on a mid-tier model at medium thinking (Amp parity).
+		expect(setThinkingCalls).toEqual(["medium"]);
 		expect(setModelCalls.length).toBe(1);
 	});
 
@@ -211,5 +306,79 @@ describe("mode config + /mode command", () => {
 		const ctx = { hasUI: true, ui: { notify: (text: string) => notices.push(text) }, modelRegistry: registryOf(fableParent), model: fableParent };
 		await command.handler("turbo", ctx as never);
 		expect(notices[0]).toMatch(/Usage: \/mode/);
+	});
+
+	test("/mode filter <kw> persists the filter and reports the narrowed pool; filter off clears it", async () => {
+		const { command } = loadModeCommand();
+		const notices: string[] = [];
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (text: string) => notices.push(text) },
+			modelRegistry: registryOf(openrouterStrong, openrouterFast, haiku, localFree),
+			model: fableParent,
+		};
+
+		await command.handler("filter openrouter", ctx as never);
+		// Persisted the filter.
+		expect(JSON.parse(await readFile(join(dir, "subagent-kit.json"), "utf8")).modelFilter).toBe("openrouter");
+		// Reported the narrowed pool and routed search within it (OpenRouter mini, not the $0 local model).
+		expect(notices[0]).toContain("pool: 2 of 4 models (filter: openrouter)");
+		expect(notices[0]).toContain("search → openrouter/openai/gpt-5.5-mini");
+
+		notices.length = 0;
+		await command.handler("filter off", ctx as never);
+		expect(JSON.parse(await readFile(join(dir, "subagent-kit.json"), "utf8")).modelFilter).toBeUndefined();
+		expect(notices[0]).toContain("pool: 4 models (no filter)");
+	});
+
+	test("/mode applies the parentModel override in both modes with the manual-override marker", async () => {
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ parentModel: "openrouter/openai/gpt-5.5" }));
+		const { command, setModelCalls, setThinkingCalls } = loadModeCommand();
+		const notices: string[] = [];
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (text: string) => notices.push(text) },
+			modelRegistry: registryOf(fableParent, openrouterStrong, glm, haiku),
+			model: fableParent,
+		};
+
+		await command.handler("medium", ctx as never);
+		expect(setThinkingCalls).toEqual(["medium"]);
+		// Parent switched to the pinned model, shown as a manual override rather than the strong alias pick.
+		expect(setModelCalls).toEqual([openrouterStrong]);
+		expect(notices[0]).toContain("openrouter/openai/gpt-5.5 (manual override)");
+	});
+
+	test("/mode medium keeps the parent when it is already the strongest model overall", async () => {
+		const { command, setModelCalls } = loadModeCommand();
+		const notices: string[] = [];
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (text: string) => notices.push(text) },
+			modelRegistry: registryOf(gpt5, haiku),
+			model: gpt5,
+		};
+
+		await command.handler("medium", ctx as never);
+		expect(setModelCalls).toEqual([]);
+		expect(notices[0]).toContain("parent → openai/gpt-5.5");
+		expect(notices[0]).toContain("model unchanged");
+	});
+
+	test("/mode rejects an ambiguous bare parentModel override", async () => {
+		await writeFile(join(dir, "subagent-kit.json"), JSON.stringify({ parentModel: "gpt-5.5" }));
+		const { command, setModelCalls } = loadModeCommand();
+		const notices: string[] = [];
+		const duplicate = model({ provider: "gateway-b", id: "gpt-5.5", reasoning: true, input: 10, output: 40 });
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (text: string) => notices.push(text) },
+			modelRegistry: registryOf(gpt5, duplicate),
+			model: fableParent,
+		};
+
+		await command.handler("medium", ctx as never);
+		expect(setModelCalls).toEqual([]);
+		expect(notices[0]).toMatch(/parentModel gpt-5\.5 is ambiguous.*openai\/gpt-5\.5.*gateway-b\/gpt-5\.5/i);
 	});
 });

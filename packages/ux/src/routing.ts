@@ -32,6 +32,7 @@ export function isModelAlias(spec: string): spec is ModelAlias {
 }
 
 export type ModelTier = "strong" | "mid" | "fast";
+export const MODEL_TIERS = ["strong", "mid", "fast"] as const;
 
 /**
  * Coarse tier priors keyed on lowercased model-id substrings. First match wins, so
@@ -51,6 +52,8 @@ export const MODEL_TIER_PRIORS: TierRule[] = [
 	{ pattern: "haiku", tier: "fast" },
 	{ pattern: "-lite", tier: "fast" },
 	{ pattern: "-8b", tier: "fast" },
+	{ pattern: "highspeed", tier: "fast" },
+	{ pattern: "turbo", tier: "fast" },
 	// Strong reasoners.
 	{ pattern: "gpt-5", tier: "strong" },
 	{ pattern: "o1", tier: "strong" },
@@ -64,6 +67,7 @@ export const MODEL_TIER_PRIORS: TierRule[] = [
 	{ pattern: "deepseek", tier: "mid" },
 	{ pattern: "qwen-max", tier: "mid" },
 	{ pattern: "qwen", tier: "mid" },
+	{ pattern: "kimi", tier: "mid" },
 	{ pattern: "sonnet", tier: "mid" },
 	{ pattern: "gemini", tier: "mid" },
 	{ pattern: "gpt-4", tier: "mid" },
@@ -92,6 +96,7 @@ export const MODEL_FAMILY_PRIORS: FamilyRule[] = [
 	{ pattern: "glm", family: "zhipu" },
 	{ pattern: "deepseek", family: "deepseek" },
 	{ pattern: "qwen", family: "qwen" },
+	{ pattern: "kimi", family: "moonshot" },
 	{ pattern: "llama", family: "meta" },
 	{ pattern: "mistral", family: "mistral" },
 	{ pattern: "grok", family: "xai" },
@@ -101,9 +106,15 @@ export const MODEL_FAMILY_PRIORS: FamilyRule[] = [
 export const STRONG_COST_FLOOR = 5;
 export const FAST_COST_CEILING = 1;
 
-function priorTier(id: string): ModelTier | undefined {
+/**
+ * Prior tier from id substrings. User rules (from config `tiers`) are PREPENDED so they win, then the
+ * built-in table; first match wins within the combined, order-preserved list. Returns undefined when
+ * nothing matches, which is what distinguishes a prior-qualified model from a metadata-only guess.
+ */
+function priorTier(id: string, userTiers?: TierRule[]): ModelTier | undefined {
 	const lower = id.toLowerCase();
-	for (const rule of MODEL_TIER_PRIORS) if (lower.includes(rule.pattern)) return rule.tier;
+	const rules = userTiers?.length ? [...userTiers, ...MODEL_TIER_PRIORS] : MODEL_TIER_PRIORS;
+	for (const rule of rules) if (lower.includes(rule.pattern.toLowerCase())) return rule.tier;
 	return undefined;
 }
 
@@ -119,9 +130,25 @@ function metadataTier(model: RegistryModel): ModelTier {
 	return "mid";
 }
 
-/** Effective tier: id prior first (heuristic), metadata second (objective). */
-export function effectiveTier(model: RegistryModel): ModelTier {
-	return priorTier(model.id) ?? metadataTier(model);
+/** True when a model's tier comes from an id prior (built-in or user), not from a metadata guess. */
+function hasPriorTier(model: RegistryModel, userTiers?: TierRule[]): boolean {
+	return priorTier(model.id, userTiers) !== undefined;
+}
+
+/**
+ * Free-model guard. A $0-cost model whose tier is only a metadata fallback (no id prior matched) is NOT
+ * a qualified pick — free is not a qualification. Such models must never win a scored alias over a
+ * prior-matched model, so scores subtract a dominating penalty for them (relative order among themselves
+ * is preserved, so a pool of only free/unknown models still resolves to one).
+ */
+function isUnqualifiedFree(model: RegistryModel, userTiers?: TierRule[]): boolean {
+	return avgCost(model) === 0 && !hasPriorTier(model, userTiers);
+}
+const FREE_UNQUALIFIED_PENALTY = 1e7;
+
+/** Effective tier: id prior first (heuristic, user rules included), metadata second (objective). */
+export function effectiveTier(model: RegistryModel, userTiers?: TierRule[]): ModelTier {
+	return priorTier(model.id, userTiers) ?? metadataTier(model);
 }
 
 function tierRank(tier: ModelTier): number {
@@ -140,8 +167,9 @@ export function sameModel(a: RegistryModel, b: RegistryModel): boolean {
 }
 
 /** Higher is stronger: tier dominates, reasoning support next, cost/context break ties. */
-function strongScore(model: RegistryModel): number {
-	return tierRank(effectiveTier(model)) * 1000 + (model.reasoning ? 200 : 0) + avgCost(model) + model.contextWindow / 1e9;
+function strongScore(model: RegistryModel, userTiers?: TierRule[]): number {
+	const guard = isUnqualifiedFree(model, userTiers) ? FREE_UNQUALIFIED_PENALTY : 0;
+	return tierRank(effectiveTier(model, userTiers)) * 1000 + (model.reasoning ? 200 : 0) + avgCost(model) + model.contextWindow / 1e9 - guard;
 }
 
 function costScore(model: RegistryModel): number {
@@ -150,6 +178,41 @@ function costScore(model: RegistryModel): number {
 
 function pickBy(models: RegistryModel[], score: (model: RegistryModel) => number): RegistryModel {
 	return models.reduce((best, model) => (score(model) > score(best) ? model : best));
+}
+
+/** Normalize the case-insensitive keyword filter (string or list) into a lowercased, non-empty keyword array. */
+function normalizeFilter(filter: string | string[] | undefined): string[] {
+	if (filter === undefined) return [];
+	const list = Array.isArray(filter) ? filter : [filter];
+	return list.map((keyword) => keyword.trim().toLowerCase()).filter((keyword) => keyword.length > 0);
+}
+
+/** Substring-match a model against the keyword filter over provider, id, and `provider/id`. */
+function matchesFilter(model: RegistryModel, keywords: string[]): boolean {
+	const haystacks = [model.provider.toLowerCase(), model.id.toLowerCase(), `${model.provider}/${model.id}`.toLowerCase()];
+	return keywords.some((keyword) => haystacks.some((hay) => hay.includes(keyword)));
+}
+
+/**
+ * The candidate pool for an alias: the registry narrowed by `modelFilter` when set. If a filter is set but
+ * matches nothing, we fall back to the whole registry AND surface a degradation reason so the outcome is
+ * marked degraded rather than silently ignoring the filter.
+ */
+function candidatePool(options: AliasResolveOptions): { pool: RegistryModel[]; filterDegraded?: string } {
+	const available = options.registry.getAvailable();
+	const keywords = normalizeFilter(options.modelFilter);
+	if (keywords.length === 0) return { pool: available };
+	const filtered = available.filter((model) => matchesFilter(model, keywords));
+	if (filtered.length === 0) return { pool: available, filterDegraded: "modelFilter matched no models" };
+	return { pool: filtered };
+}
+
+/** Count models in the registry that match the filter (for `/mode` pool sizing); mirrors {@link candidatePool}. */
+export function filterPoolSize(options: AliasResolveOptions): { matched: number; total: number; keywords: string[] } {
+	const available = options.registry.getAvailable();
+	const keywords = normalizeFilter(options.modelFilter);
+	if (keywords.length === 0) return { matched: available.length, total: available.length, keywords };
+	return { matched: available.filter((model) => matchesFilter(model, keywords)).length, total: available.length, keywords };
 }
 
 /** Structured resolution result. Silent degradation is forbidden, so every outcome carries `degraded`. */
@@ -165,6 +228,10 @@ export interface ResolutionOutcome {
 export interface AliasResolveOptions {
 	registry: Pick<ModelRegistry, "getAvailable">;
 	parentModel?: RegistryModel;
+	/** Case-insensitive keyword(s); only matching models (provider/id/`provider/id`) form the candidate pool. */
+	modelFilter?: string | string[];
+	/** User tier rules from config, PREPENDED to the built-in priors (first match wins). */
+	userTiers?: TierRule[];
 }
 
 function modelId(model: RegistryModel): string {
@@ -182,14 +249,18 @@ function parentFallback(alias: ModelAlias, parent: RegistryModel | undefined, de
 	};
 }
 
-function resolveStrong(options: AliasResolveOptions): ResolutionOutcome {
-	const { parentModel } = options;
-	const available = options.registry.getAvailable();
-	if (available.length === 0) return parentFallback(STRONG_REASONING_ALIAS, parentModel, "no models available; using the parent model");
+function resolveStrong(pool: RegistryModel[], options: AliasResolveOptions): ResolutionOutcome {
+	const { parentModel, userTiers } = options;
+	if (pool.length === 0) return parentFallback(STRONG_REASONING_ALIAS, parentModel, "no models available; using the parent model");
+
+	// Free is not a qualification: an unqualified $0 model is never eligible while any qualified model exists,
+	// even as the sole heterogeneous option — so it cannot win strong-reasoning over a prior-matched model.
+	const qualified = pool.filter((model) => !isUnqualifiedFree(model, userTiers));
+	const available = qualified.length ? qualified : pool;
 
 	const parentFam = parentModel ? modelFamily(parentModel) : undefined;
 	const hetero = parentFam ? available.filter((model) => modelFamily(model) !== parentFam) : available;
-	const best = pickBy(hetero.length ? hetero : available, strongScore);
+	const best = pickBy(hetero.length ? hetero : available, (model) => strongScore(model, userTiers));
 
 	if (parentModel && sameModel(best, parentModel)) {
 		return {
@@ -211,6 +282,30 @@ function resolveStrong(options: AliasResolveOptions): ResolutionOutcome {
 			? "strongest model from a different family than the parent (heterogeneous second opinion)"
 			: "strongest available model (no heterogeneous option in the pool)",
 	};
+}
+
+/** Resolve the strongest qualified model without Oracle's heterogeneous-family preference. */
+export function resolveStrongestOverall(options: AliasResolveOptions): ResolutionOutcome {
+	const { pool, filterDegraded } = candidatePool(options);
+	if (pool.length === 0) {
+		return foldFilterDegraded(
+			parentFallback(STRONG_REASONING_ALIAS, options.parentModel, "no models available; using the parent model"),
+			filterDegraded,
+		);
+	}
+	const qualified = pool.filter((model) => !isUnqualifiedFree(model, options.userTiers));
+	const candidates = qualified.length ? qualified : pool;
+	const best = pickBy(candidates, (model) => strongScore(model, options.userTiers));
+	return foldFilterDegraded({
+		alias: STRONG_REASONING_ALIAS,
+		model: best,
+		modelId: modelId(best),
+		degraded: qualified.length === 0,
+		reason: options.parentModel && sameModel(best, options.parentModel)
+			? "strongest overall model is already the parent model"
+			: "strongest overall model",
+		...(qualified.length === 0 ? { degradedReason: "only unqualified free/local models are available" } : {}),
+	}, filterDegraded);
 }
 
 function resolveCheapest(alias: ModelAlias, candidates: RegistryModel[], options: AliasResolveOptions, reason: string): ResolutionOutcome {
@@ -235,19 +330,38 @@ function resolveCheapest(alias: ModelAlias, candidates: RegistryModel[], options
 	return { alias, model: cheapest, modelId: modelId(cheapest), degraded: false, reason };
 }
 
-function resolveFast(options: AliasResolveOptions): ResolutionOutcome {
-	const available = options.registry.getAvailable();
+/**
+ * Fast-search selection is TIER-first, cost-second. Order:
+ *   1. cheapest NON-ZERO-cost fast-tier model (a real, priced fast model always wins);
+ *   2. no fast tier → cheapest non-zero-cost mid-tier model;
+ *   3. still nothing priced at fast/mid → cheapest non-zero-cost model of any tier;
+ *   4. last resort → cheapest zero-cost/unknown model, marked degraded (quality unknown).
+ * A nonzero-cost fast model is always preferred over any zero-cost/local model — free is not a qualification.
+ */
+function resolveFast(pool: RegistryModel[], options: AliasResolveOptions): ResolutionOutcome {
+	const { userTiers } = options;
+	const available = pool;
 	if (available.length === 0) return parentFallback(FAST_SEARCH_ALIAS, options.parentModel, "no models available; using the parent model");
-	return resolveCheapest(FAST_SEARCH_ALIAS, available, options, "cheapest available model (fastest suitable for search)");
+	const priced = available.filter((model) => costScore(model) > 0);
+	const fast = priced.filter((model) => effectiveTier(model, userTiers) === "fast");
+	if (fast.length > 0) return resolveCheapest(FAST_SEARCH_ALIAS, fast, options, "cheapest fast-tier model (fastest suitable for search)");
+	const mid = priced.filter((model) => effectiveTier(model, userTiers) === "mid");
+	if (mid.length > 0) return resolveCheapest(FAST_SEARCH_ALIAS, mid, options, "no fast-tier model in the pool; cheapest mid-tier model");
+	if (priced.length > 0) return resolveCheapest(FAST_SEARCH_ALIAS, priced, options, "no fast/mid-tier model in the pool; cheapest priced model");
+	// Only free/local models remain: pick the cheapest but flag it — a $0 local model's quality is unknown.
+	const outcome = resolveCheapest(FAST_SEARCH_ALIAS, available, options, "only free/local models available");
+	return { ...outcome, degraded: true, degradedReason: "only free/local models available for fast-search — quality unknown" };
 }
 
-function resolveBalanced(options: AliasResolveOptions): ResolutionOutcome {
-	const available = options.registry.getAvailable();
-	if (available.length === 0) return parentFallback(BALANCED_ALIAS, options.parentModel, "no models available; using the parent model");
-	const mids = available.filter((model) => effectiveTier(model) === "mid");
+function resolveBalanced(pool: RegistryModel[], options: AliasResolveOptions): ResolutionOutcome {
+	const { userTiers } = options;
+	if (pool.length === 0) return parentFallback(BALANCED_ALIAS, options.parentModel, "no models available; using the parent model");
+	const qualified = pool.filter((model) => !isUnqualifiedFree(model, userTiers));
+	const available = qualified.length ? qualified : pool;
+	const mids = available.filter((model) => effectiveTier(model, userTiers) === "mid");
 	if (mids.length > 0) {
 		// A real mid-tier model exists: take the most capable one, tie-broken toward the cheaper.
-		const pick = pickBy(mids, (model) => strongScore(model) - costScore(model) / 1e6);
+		const pick = pickBy(mids, (model) => strongScore(model, userTiers) - costScore(model) / 1e6);
 		const { parentModel } = options;
 		const hasAlternative = parentModel ? available.some((model) => !sameModel(model, parentModel)) : true;
 		if (parentModel && sameModel(pick, parentModel) && !hasAlternative) {
@@ -265,19 +379,36 @@ function resolveBalanced(options: AliasResolveOptions): ResolutionOutcome {
 	// No explicit mid tier: fall to the pool's median cost as a balanced default.
 	const sorted = [...available].sort((a, b) => costScore(a) - costScore(b));
 	const median = sorted[Math.floor((sorted.length - 1) / 2)];
-	return resolveCheapest(BALANCED_ALIAS, [median], options, "median-cost model (no mid-tier model in the pool)");
+	const outcome = resolveCheapest(BALANCED_ALIAS, [median], options, "median-cost model (no mid-tier model in the pool)");
+	return qualified.length
+		? outcome
+		: { ...outcome, degraded: true, degradedReason: "only unqualified free/local models are available for balanced routing" };
+}
+
+/** Fold an active filter's degradation into an otherwise-resolved outcome (an empty filter match is never silent). */
+function foldFilterDegraded(outcome: ResolutionOutcome, filterDegraded: string | undefined): ResolutionOutcome {
+	if (!filterDegraded) return outcome;
+	return {
+		...outcome,
+		degraded: true,
+		degradedReason: outcome.degraded && outcome.degradedReason ? `${filterDegraded}; ${outcome.degradedReason}` : filterDegraded,
+	};
 }
 
 /** Resolve one alias to a concrete model plus a structured, displayable outcome. */
 export function resolveAlias(alias: ModelAlias, options: AliasResolveOptions): ResolutionOutcome {
-	switch (alias) {
-		case "strong-reasoning":
-			return resolveStrong(options);
-		case "fast-search":
-			return resolveFast(options);
-		case "balanced":
-			return resolveBalanced(options);
-	}
+	const { pool, filterDegraded } = candidatePool(options);
+	const resolve = () => {
+		switch (alias) {
+			case "strong-reasoning":
+				return resolveStrong(pool, options);
+			case "fast-search":
+				return resolveFast(pool, options);
+			case "balanced":
+				return resolveBalanced(pool, options);
+		}
+	};
+	return foldFilterDegraded(resolve(), filterDegraded);
 }
 
 /** A per-role, per-mode entry: which alias, how hard it thinks, and an optional turn budget. */
@@ -329,11 +460,13 @@ export const ROUTING_ROLES = Object.keys(MODE_ROUTING_TABLE);
 
 /**
  * The parent-session entry. Because the Pi extension API exposes `setModel`/`setThinkingLevel`,
- * `/mode` also retunes the parent orchestrator: a mid-tier model at a mode-appropriate thinking level.
+ * `/mode` also retunes the parent orchestrator, mirroring Amp's mode tiers: `medium` runs the parent on
+ * the STRONG model (like Amp's medium tier), while `low` runs it on a mid-tier model; both at a
+ * mode-appropriate thinking level. A `parentModel` config override can pin an exact model in both modes.
  */
 export const PARENT_MODE_ENTRY: Record<SubagentMode, { model: ModelAlias; thinkingLevel: ThinkingLevel }> = {
-	low: { model: "balanced", thinkingLevel: "low" },
-	medium: { model: "balanced", thinkingLevel: "medium" },
+	low: { model: "balanced", thinkingLevel: "medium" },
+	medium: { model: "strong-reasoning", thinkingLevel: "medium" },
 };
 
 /** One fully resolved routing row, ready to display or apply. */

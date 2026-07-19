@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import { loadProfileFile, type ModelSpec, type SubagentProfile } from "pi-subagent-core";
-import { isModelAlias, resolveAlias, type ModelAlias } from "./routing.ts";
+import { isModelAlias, resolveAlias, type ModelAlias, type TierRule } from "./routing.ts";
 
 export * from "./routing.ts";
 
@@ -51,6 +51,10 @@ type RegistryModel = ReturnType<ModelRegistry["getAvailable"]>[number];
 export interface ModelResolverOptions {
 	registry: Pick<ModelRegistry, "getAvailable">;
 	parentModel?: RegistryModel;
+	/** Case-insensitive keyword filter narrowing the alias candidate pool (bypassed by concrete/manual targets). */
+	modelFilter?: string | string[];
+	/** User tier rules, prepended to the built-in priors during alias resolution. */
+	userTiers?: TierRule[];
 }
 
 function matchRegistry(registry: Pick<ModelRegistry, "getAvailable">, target: string): RegistryModel[] {
@@ -81,7 +85,12 @@ export function createModelResolver(options: ModelResolverOptions): (spec: Model
 			throw new Error(`Model selection for "${spec}" is ambiguous: ${matches.map((model) => `${model.provider}/${model.id}`).join(", ")}`);
 		}
 		if (isModelAlias(spec)) {
-			const outcome = resolveAlias(spec as ModelAlias, { registry: options.registry, parentModel: options.parentModel });
+			const outcome = resolveAlias(spec as ModelAlias, {
+				registry: options.registry,
+				parentModel: options.parentModel,
+				modelFilter: options.modelFilter,
+				userTiers: options.userTiers,
+			});
 			if (outcome.model) return outcome.model;
 			throw new Error(`Model selection target "${spec}" is not available`);
 		}

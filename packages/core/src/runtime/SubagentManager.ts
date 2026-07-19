@@ -207,6 +207,7 @@ export class SubagentManager {
 			const emit = (event: DriverEvent) => {
 				if (event.type === "escalation") handle.setStatus("waiting_permission");
 				if (event.type === "permission_blocked") handle.setStatus("running");
+				if (event.type === "usage") handle.setUsage(event.usage);
 				if (event.type === "file_read" && !disclosure.filesRead.includes(event.path)) disclosure.filesRead.push(event.path);
 				if (event.type === "file_write" && !disclosure.filesModified.includes(event.path)) disclosure.filesModified.push(event.path);
 				if (event.type === "tool_call" && event.name === "bash") disclosure.commandsRun.push(event.argsPreview);

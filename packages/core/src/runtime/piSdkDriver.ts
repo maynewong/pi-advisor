@@ -41,19 +41,21 @@ function resolveRegistryModel(spec: string, registry: ModelRegistry | undefined)
 	return registry?.find(spec.slice(0, slash), spec.slice(slash + 1));
 }
 
+function addAssistantUsage(usage: UsageSnapshot, assistant: AssistantMessage): void {
+	usage.turns += 1;
+	usage.input += assistant.usage.input;
+	usage.output += assistant.usage.output;
+	usage.cacheRead += assistant.usage.cacheRead;
+	usage.cacheWrite += assistant.usage.cacheWrite;
+	usage.cost += assistant.usage.cost.total;
+	usage.contextTokens = assistant.usage.totalTokens;
+	usage.model = assistant.model;
+}
+
 function usageFromMessages(messages: AgentMessage[]): UsageSnapshot {
 	const usage: UsageSnapshot = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 	for (const message of messages) {
-		if (message.role !== "assistant") continue;
-		const assistant = message as AssistantMessage;
-		usage.turns += 1;
-		usage.input += assistant.usage.input;
-		usage.output += assistant.usage.output;
-		usage.cacheRead += assistant.usage.cacheRead;
-		usage.cacheWrite += assistant.usage.cacheWrite;
-		usage.cost += assistant.usage.cost.total;
-		usage.contextTokens = assistant.usage.totalTokens;
-		usage.model = assistant.model;
+		if (message.role === "assistant") addAssistantUsage(usage, message as AssistantMessage);
 	}
 	return usage;
 }
@@ -73,6 +75,7 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 	return async (request: DriverRequest, emit) => {
 		let submitted: unknown;
 		let turns = 0;
+		const liveUsage: UsageSnapshot = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 		// Per prompt-leg soft-budget state, reset before each run/resume turn so every resumed leg gets a fresh budget.
 		let legTurns = 0;
 		let wrapUpInjected = false;
@@ -177,6 +180,8 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 				emit({ type: "tool_result", name: event.toolName, ok: !event.isError, summary: preview(event.result) });
 			}
 			if (event.type === "message_end" && event.message.role === "assistant") {
+				addAssistantUsage(liveUsage, event.message as AssistantMessage);
+				emit({ type: "usage", usage: { ...liveUsage } });
 				for (const part of event.message.content) {
 					const text = part.type === "thinking" ? part.thinking : part.type === "text" ? part.text : undefined;
 					if (text === undefined) continue;

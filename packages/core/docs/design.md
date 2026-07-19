@@ -177,6 +177,7 @@ The event stream is a reduced projection of child session events:
 
 - `started`
 - `turn`
+- `usage`
 - `tool_call`
 - `tool_result`
 - `file_read`

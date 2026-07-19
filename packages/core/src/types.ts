@@ -55,6 +55,7 @@ export type SubagentStatus = "queued" | "running" | "waiting_permission" | "comp
 export type SubagentEvent =
 	| { type: "started"; id: string; metadata?: Record<string, unknown> }
 	| { type: "turn"; index: number }
+	| { type: "usage"; usage: UsageSnapshot }
 	| { type: "tool_call"; name: string; argsPreview: string; summary?: string }
 	| { type: "tool_result"; name: string; ok: boolean; summary: string }
 	| { type: "file_read"; path: string }
