@@ -80,6 +80,11 @@ export interface SubagentResult {
 	status: SubagentStatus;
 	output?: unknown;
 	text: string;
+	/**
+	 * Set when a run completed only because it reached its soft turn budget and was asked to wrap up.
+	 * The answer is a best-effort partial: the parent may extend it via the resume path (subagent_send).
+	 */
+	stoppedBy?: "turn_budget";
 	error?: { message: string; kind: "model" | "tool" | "timeout" | "aborted" | "protocol" | "max_turns" };
 	usage: UsageSnapshot;
 	disclosure: SubagentDisclosure;

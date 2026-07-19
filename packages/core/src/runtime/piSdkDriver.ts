@@ -17,7 +17,7 @@ import { evaluatePermission } from "../permission/evaluatePermission.ts";
 import { PermissionEscalations } from "../permission/PermissionEscalations.ts";
 import type { ContextInput } from "../types.ts";
 import type { DriverRequest, DriverRunResult, RuntimeDriverFactory } from "./driver.ts";
-import { describeToolCall, driverErrorFromMessages, resolveActiveTools, successfulFileEvent, thoughtPreview } from "./piSdkDriverSupport.ts";
+import { describeToolCall, driverErrorFromMessages, hardTurnCeiling, resolveActiveTools, successfulFileEvent, thoughtPreview, turnBudgetAction, wrapUpInstruction } from "./piSdkDriverSupport.ts";
 
 interface PiSdkDriverOptions {
 	cwd: string;
@@ -73,6 +73,10 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 	return async (request: DriverRequest, emit) => {
 		let submitted: unknown;
 		let turns = 0;
+		// Per prompt-leg soft-budget state, reset before each run/resume turn so every resumed leg gets a fresh budget.
+		let legTurns = 0;
+		let wrapUpInjected = false;
+		let hardStopped = false;
 		const pendingTools = new Map<string, { name: string; args: Record<string, unknown> }>();
 		let lastThought: string | undefined;
 		const escalations = new PermissionEscalations(emit);
@@ -145,8 +149,18 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 		const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
 			if (event.type === "turn_start") {
 				turns += 1;
+				legTurns += 1;
 				emit({ type: "turn", index: turns });
-				if (request.profile.maxTurns && turns > request.profile.maxTurns) void session.abort();
+				// Soft landing: at the soft budget inject a wrap-up instruction and allow the child a final turn;
+				// only the hard ceiling (a runaway backstop) aborts the run outright.
+				const action = turnBudgetAction(legTurns, request.profile.maxTurns, wrapUpInjected);
+				if (action === "hard_stop") {
+					hardStopped = true;
+					void session.abort();
+				} else if (action === "wrap_up") {
+					wrapUpInjected = true;
+					void session.steer(wrapUpInstruction(output));
+				}
 			}
 			if (event.type === "tool_execution_start") {
 				const args = event.args && typeof event.args === "object" ? event.args as Record<string, unknown> : {};
@@ -175,14 +189,17 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 		});
 		// Reduce the current session state into a driver result; shared by the initial run and any resume turn.
 		const collect = (promptError: unknown): DriverRunResult => {
-			const error = request.profile.maxTurns && turns > request.profile.maxTurns
-				? { kind: "max_turns" as const, message: `Subagent exceeded maxTurns ${request.profile.maxTurns}` }
+			// The hard ceiling is the only path that still fails as max_turns; the soft budget lands as a completed partial.
+			const error = hardStopped && request.profile.maxTurns
+				? { kind: "max_turns" as const, message: `Subagent exceeded the hard turn ceiling ${hardTurnCeiling(request.profile.maxTurns)} (soft budget ${request.profile.maxTurns})` }
 				: promptError
 					? { kind: "model" as const, message: promptError instanceof Error ? promptError.message : String(promptError) }
 					: driverErrorFromMessages(session.messages);
+			const stoppedByBudget = wrapUpInjected && !hardStopped;
 			return {
 				text: assistantText(session.messages),
 				...(error ? { error } : {}),
+				...(stoppedByBudget ? { stoppedBy: "turn_budget" as const } : {}),
 				...(submitted !== undefined ? { submitted } : {}),
 				usage: usageFromMessages(session.messages),
 				transcript: JSON.stringify(session.messages, null, 2),
@@ -190,6 +207,10 @@ export function createPiSdkDriver(options: PiSdkDriverOptions): RuntimeDriverFac
 			};
 		};
 		const promptTurn = async (message: string): Promise<DriverRunResult> => {
+			// Each leg (initial run or a resume) gets a fresh soft budget.
+			legTurns = 0;
+			wrapUpInjected = false;
+			hardStopped = false;
 			let promptError: unknown;
 			try {
 				await session.prompt(message);

@@ -200,6 +200,8 @@ interface SubagentResult {
   status: "completed" | "failed" | "aborted" | "timeout";
   output?: unknown;
   text: string;
+  /** Set when the run completed only because it hit its soft turn budget and wrapped up (a partial). */
+  stoppedBy?: "turn_budget";
   error?: {
     message: string;
     kind: "model" | "tool" | "timeout" | "aborted" | "protocol" | "max_turns";
@@ -314,8 +316,36 @@ message and return a `model` failure rather than treating empty text as success.
 The driver also preserves transcripts and usage on failures. The manager writes
 those artifacts before completing the handle.
 
-Turn-budget exhaustion has the distinct `max_turns` kind. It must not be
-collapsed into a generic model error.
+### 8.1 Soft turn budget (soft landing)
+
+Reaching a profile's `maxTurns` is no longer a hard kill that wastes the run's
+spend. The budget is a **soft landing** built from three layers:
+
+1. **Deterministic backstop (code).** The driver counts turns per prompt leg.
+   When the count first passes the soft budget it injects a wrap-up instruction
+   into the child session (via `steer`): *"Turn budget reached. Stop
+   investigating now and submit your best answer from what you have found so
+   far. Mark anything unverified as an assumption."* For schema profiles the
+   instruction also tells the child to call the output tool now with a
+   low/uncertain result. A hard absolute ceiling — `ceil(3 × maxTurns)` — is the
+   runaway backstop: only crossing it aborts the run and still produces the old
+   `max_turns` **failure**. Normal work never reaches it.
+2. **Graceful wrap-up (child).** The child spends one final turn landing its
+   best partial answer instead of being killed mid-thought.
+3. **Parent extension (resume).** A budget landing completes as a normal
+   **completed** result, so the existing resume path (`SubagentManager.resume` /
+   `subagent_send`) continues the conversation unchanged. The parent model reads
+   the partial and decides whether to extend.
+
+A landed result carries `stoppedBy: "turn_budget"` (a completed partial), which
+survives into `result.json` and is visible to the parent. `max_turns` now marks
+**only** the hard-ceiling failure; the soft budget is never a failure.
+
+**Fresh budget per resume leg.** The soft budget applies per prompt leg: the
+driver resets its turn counter and wrap-up state at the start of every `run` and
+`resume`. A run that landed on its budget therefore gets a full fresh budget on
+each extension, so `subagent_send` gives the child real room to finish rather
+than reusing an already-exhausted count.
 
 ## 9. Runtime Constraints
 
@@ -379,7 +409,11 @@ decisions.
   `subagent_send` tool for follow-up conversation: a running run is redirected
   (steered) mid-flight, while a completed run is continued via the core
   `resume` path and returns a new result.
-- The `/subagents` command
+- The `/subagents` command and the `/mode` command
+- A two-mode (`low` | `medium`) routing table plus an auto model resolver that
+  scores alias candidates (`strong-reasoning`, `fast-search`, `balanced`) against
+  the live model registry. This lives entirely in UX: Core keeps only the neutral
+  `resolveModel` hook and learns nothing about modes or aliases.
 - Built-in Oracle, Search, Reviewer, and Worker profile cards (Worker ships as a
   loadable card without a dedicated tool)
 - Streaming progress projection

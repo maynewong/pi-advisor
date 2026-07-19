@@ -144,13 +144,31 @@ describe("SubagentManager", () => {
 		expect(await readFile(result.artifacts!.transcript!, "utf8")).toBe("model failure transcript");
 	});
 
-	test("preserves maxTurns as a distinct failure kind", async () => {
+	test("preserves the hard-ceiling max_turns as a distinct failure kind", async () => {
 		const factory: RuntimeDriverFactory = async () => ({
-			run: async () => ({ text: "", error: { kind: "max_turns", message: "Subagent exceeded maxTurns 2" } }),
+			run: async () => ({ text: "", error: { kind: "max_turns", message: "Subagent exceeded the hard turn ceiling 6 (soft budget 2)" } }),
 			async abort() {},
 		});
 		const result = await new SubagentManager({ cwd: "/repo", createDriver: factory }).spawn(PROFILE, "bounded task").wait();
 		expect(result).toMatchObject({ status: "failed", error: { kind: "max_turns" } });
+	});
+
+	test("lands a soft-budget wrap-up as a completed partial carrying stoppedBy", async () => {
+		const factory: RuntimeDriverFactory = async () => ({
+			run: async () => ({ text: "best partial answer", stoppedBy: "turn_budget", usage: { input: 5, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0.01, turns: 9 } }),
+			async abort() {},
+		});
+		const result = await new SubagentManager({ cwd: "/repo", createDriver: factory }).spawn({ ...PROFILE, maxTurns: 8 }, "bounded task").wait();
+		expect(result).toMatchObject({ status: "completed", text: "best partial answer", stoppedBy: "turn_budget" });
+		expect(result.error).toBeUndefined();
+	});
+
+	test("persists the soft-landing flag into the result artifact", async () => {
+		const artifactsDir = await mkdtemp(join(tmpdir(), "subagent-budget-"));
+		const factory: RuntimeDriverFactory = async () => ({ run: async () => ({ text: "partial", stoppedBy: "turn_budget" }), async abort() {} });
+		const manager = new SubagentManager({ cwd: "/repo", artifactsDir, createDriver: factory });
+		const result = await manager.spawn({ ...PROFILE, maxTurns: 4 }, "budget task").wait();
+		expect(JSON.parse(await readFile(result.artifacts!.result!, "utf8"))).toMatchObject({ status: "completed", stoppedBy: "turn_budget" });
 	});
 
 	test("resolves a failed result when the artifacts directory is unusable", async () => {

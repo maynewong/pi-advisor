@@ -17,6 +17,8 @@ export interface DriverRequest {
 export interface DriverRunResult {
 	text: string;
 	error?: SubagentResult["error"];
+	/** Marks a result that landed on the soft turn budget after a wrap-up turn rather than finishing freely. */
+	stoppedBy?: SubagentResult["stoppedBy"];
 	submitted?: unknown;
 	usage?: UsageSnapshot;
 	transcript?: string;

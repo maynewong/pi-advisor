@@ -24,12 +24,16 @@ The generic `subagent` tool is primarily for custom profile `.md` paths — incl
 - `files`, `includeDiff` — inject selected files and/or the current working-tree diff (working tree vs `HEAD`) into the context packet.
 - `inheritConversation` — fork the current conversation into the subagent so it inherits parent context. Overrides the agent's context mode to `fork` and requires a persisted session.
 - `writeScope` — restrict the subagent's writes to these globs (relative to cwd). Use this when delegating to the `worker` card so writes stay inside the intended blast radius.
-- `maxTurns` — cap the run's turn budget.
+- `maxTurns` — cap the run's **soft** turn budget (see [Soft turn budget](#soft-turn-budget) below). Reaching it wraps the run up with a partial answer rather than killing it.
 - `background` — start the run and return immediately with a run id; the live overview keeps updating. Fetch the result later with `subagent_result { id, wait? }`.
 
 `subagent_result` returns the full summary when the run is terminal or `wait: true`; otherwise it returns current status and recent milestones. It also returns the latest result after a run is continued with `subagent_send`.
 
-`subagent_send { id, message, wait? }` sends a follow-up to an existing run in this session. A **running** run is redirected mid-flight (steered) and the tool returns immediately; the run's own result still surfaces via its original call or `subagent_result`. A **completed** run is continued with a new turn on its retained session, and unless `wait: false` the tool blocks and returns the new result. Runs that ended as failed, aborted, or timed out cannot be continued.
+`subagent_send { id, message, wait? }` sends a follow-up to an existing run in this session. A **running** run is redirected mid-flight (steered) and the tool returns immediately; the run's own result still surfaces via its original call or `subagent_result`. A **completed** run is continued with a new turn on its retained session, and unless `wait: false` the tool blocks and returns the new result. This is also how you **extend a run that landed on its soft turn budget** (status `completed`, note `⏳ turn budget reached`): the resumed leg gets a fresh budget to finish the work. Runs that ended as failed, aborted, or timed out cannot be continued.
+
+## Soft turn budget
+
+Turn budgets are a soft landing, not a hard kill. When a run reaches its `maxTurns`, the child is asked to stop investigating and submit its best partial answer (marking anything unverified as an assumption); the run then completes normally with a `stoppedBy: "turn_budget"` marker and a `⏳ turn budget reached — partial answer; extend with subagent_send` note in the summary. Deterministic code keeps a runaway backstop — an absolute ceiling at 3× the soft budget still fails as `max_turns` — but normal work never reaches it. Because a landed run is a completed partial, the parent can read it and extend it with `subagent_send`, which gives the resumed leg a fresh budget. See core `docs/design.md` §8.1 for the full three-layer design.
 
 ## `/subagents`
 
@@ -42,6 +46,7 @@ User-scoped settings live in `~/.pi/agent/subagent-kit.json` (or the agent direc
 
 ```json
 {
+  "mode": "medium",
   "agents": { "oracle": { "model": "gpt-5.5" } },
   "oracleGuidance": true,
   "artifactsDir": "./.pi/subagent-runs",
@@ -50,10 +55,32 @@ User-scoped settings live in `~/.pi/agent/subagent-kit.json` (or the agent direc
 }
 ```
 
-- `agents.<name>.model` — per-agent model override. A bare model ID or name must match exactly one authenticated model; use `provider/model-id` to disambiguate. An unavailable or ambiguous target fails the run. Unconfigured agents keep their role-card and parent-model fallback (via the `strong-reasoning` alias). Model resolution runs through core's injected `resolveModel` (`createModelResolver`, exported for third-party hosts).
+- `mode` — effort knob, `"low"` or `"medium"` (default `"medium"`). See [Mode & model routing](#mode--model-routing).
+- `agents.<name>.model` — per-agent model override and the escape hatch that **beats the routing table**. A bare model ID or name must match exactly one authenticated model; use `provider/model-id` to disambiguate. An unavailable or ambiguous target fails the run. Unconfigured agents follow the mode routing table (alias resolution with a parent-model fallback). Model resolution runs through core's injected `resolveModel` (`createModelResolver`, exported for third-party hosts).
 - `oracleGuidance` — accepted for backwards compatibility but no longer has any effect. The Oracle consultation policy now lives in the dedicated `oracle` tool description instead of being injected into the parent system prompt.
 - `artifactsDir` — override the artifacts location (relative paths resolve against cwd). By default runs are stored globally under `<agentDir>/subagent-runs/<project-slug>-<hash>`, so they no longer clutter the project tree.
 - `retentionDays` / `maxRuns` — lazy retention. On first use per project, run directories older than `retentionDays` are pruned (0 disables age pruning), then the newest survivors are trimmed to `maxRuns`. Cleanup never fails a spawn.
+
+## Mode & model routing
+
+Each built-in role resolves its model through a two-mode routing table (`low` | `medium`, default `medium`). A mode entry is `{ model alias, thinkingLevel, maxTurns? }`, so effort stays real even when the model pool is shallow: if every alias collapses to the same model, `low` and `medium` still differ by thinking level and turn budget. Turn budgets are **soft** (see [Soft turn budget](#soft-turn-budget)), so they are set to generous "background insurance" values a normal run rarely reaches: search `8`/`12`, reviewer `8`/`12`, worker `12`/`16`, and oracle a generous `16` in both modes (oracle is a few-turn, heavy-thinking role, so its budget is only a backstop, never a daily constraint).
+
+Aliases resolve against the **actual** authenticated model registry, scored on registry metadata (cost, context window, reasoning support) plus a small, editable prior table mapping known model-id substrings to coarse tiers (`gpt-5*`/`o*`/`opus`/`fable` → strong; `glm`/`deepseek`/`qwen`/`sonnet` → mid; `*-air`/`*flash`/`*mini`/`haiku` → fast). The tables are exported (`MODEL_TIER_PRIORS`, `MODEL_FAMILY_PRIORS`) and easy to edit.
+
+- `strong-reasoning` (oracle) — the strongest model from a **different** provider/family than the parent (a heterogeneous second opinion); if none, the strongest overall; if that is the parent itself, it falls back to the parent and is flagged **degraded** (oracle then runs with half its value: independent context only, no independent model).
+- `fast-search` (search) — the cheapest/fastest qualifying model.
+- `balanced` (reviewer, worker) — a mid-tier model.
+
+Per-role sensitivity guidance: **search** and **reviewer** work fine on weak/cheap models — routing them to a fast or mid model is the whole point of `low` mode. **Oracle** is the one role worth a paid strong-model key: a degraded oracle gives you only an independent context, not an independent stronger reasoner. Set `agents.oracle.model` to force a specific strong model.
+
+Every resolution produces a structured outcome (`{ alias, modelId, reason, degraded, degradedReason? }`); degradation is never silent. When a run uses a degraded resolution, a one-line note is added to its milestones and completed summary.
+
+### `/mode`
+
+- `/mode` — print the current resolved routing table: one line per role showing resolved model id, thinking level, and turn budget, with a `⚠` marker and explanation on degraded rows.
+- `/mode low` / `/mode medium` — persist the mode into `subagent-kit.json` (other fields preserved) and reprint the table.
+
+Because the Pi extension API exposes `setModel`/`setThinkingLevel`, `/mode low|medium` also **retunes the parent session** per a `balanced` parent entry (mid-tier model + mode-appropriate thinking level). A manual `agents.<role>.model` override always beats the table for that role.
 
 ## Oracle workflow
 

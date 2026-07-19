@@ -5,6 +5,7 @@ import { describe, expect, test } from "vitest";
 import { builtInAgentNames, createModelResolver, getBuiltInAgentPath, loadBuiltInAgent, oracleReportSchema } from "../src/index.ts";
 import subagentExtension, {
 	appendOracleGuidance,
+	completedSummary,
 	contextForSubagent,
 	escalationDecision,
 	loadSubagentConfig,
@@ -12,7 +13,9 @@ import subagentExtension, {
 	oracleReportFromOutput,
 	resolveArtifactsDir,
 	roleToolSpecs,
+	TURN_BUDGET_NOTE,
 } from "../extensions/subagent.ts";
+import type { SubagentResult } from "pi-subagent-core";
 import type { SubagentProfile } from "pi-subagent-core";
 
 const anyProfile = { name: "any" } as SubagentProfile;
@@ -267,5 +270,25 @@ describe("dedicated per-role tools", () => {
 	test("gives search a lean read-only schema with neither includeDiff nor writeScope", () => {
 		const search = captureRegistrations().tools.get("search")!;
 		expect(Object.keys(search.parameters.properties ?? {})).toEqual(["task", "files", "background"]);
+	});
+});
+
+describe("soft turn-budget landing", () => {
+	const baseDetails = {
+		id: "r1", agent: "search", task: "t", status: "completed", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 9 },
+		milestones: [], activity: [], filesRead: [], filesModified: [],
+	} as never;
+
+	test("adds the extend-with-subagent_send note to the summary only on a budget landing", () => {
+		const landed: SubagentResult = { status: "completed", text: "partial", stoppedBy: "turn_budget", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 9 }, disclosure: { filesRead: [], filesModified: [], commandsRun: [], contextSources: [], truncated: [] } };
+		const clean: SubagentResult = { ...landed, stoppedBy: undefined };
+
+		expect(completedSummary("search", landed, baseDetails)).toContain(TURN_BUDGET_NOTE);
+		expect(completedSummary("search", clean, baseDetails)).not.toContain(TURN_BUDGET_NOTE);
+	});
+
+	test("subagent_send advertises that it can extend a budget-landed run", () => {
+		const { tools } = captureRegistrations();
+		expect(tools.get("subagent_send")!.description).toMatch(/soft turn budget/i);
 	});
 });

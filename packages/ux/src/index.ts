@@ -6,11 +6,12 @@ import { fileURLToPath } from "node:url";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import { loadProfileFile, type ModelSpec, type SubagentProfile } from "pi-subagent-core";
+import { isModelAlias, resolveAlias, type ModelAlias } from "./routing.ts";
+
+export * from "./routing.ts";
 
 export const builtInAgentNames = ["oracle", "worker", "search", "reviewer"] as const;
 export type BuiltInAgentName = typeof builtInAgentNames[number];
-
-export const STRONG_REASONING_ALIAS = "strong-reasoning";
 
 /** Single source of truth for the Oracle output contract, shared by the schema, validation, and role cards. */
 export const oracleVerdicts = ["safe_to_proceed", "proceed_with_changes", "blocked", "need_more_information"] as const;
@@ -65,9 +66,11 @@ function matchRegistry(registry: Pick<ModelRegistry, "getAvailable">, target: st
 
 /**
  * Build the alias-aware model resolver used by core's `SubagentManager({ resolveModel })` injection point.
- * A string spec is resolved against the authenticated model registry. The `strong-reasoning` alias falls back
- * to the parent model when no authenticated model matches; every other unresolved or ambiguous target throws.
- * Per-agent user overrides are supplied by the host as the spec (see the extension), so they flow through here too.
+ * A concrete model id (bare or `provider/model-id`) is matched exactly against the authenticated registry.
+ * The `strong-reasoning`, `fast-search`, and `balanced` aliases are scored against the actual registry by
+ * {@link resolveAlias}; each falls back to the parent model when the pool cannot satisfy the alias (the
+ * structured degradation is surfaced separately by the host — see `buildRoutingTable`). Any other unresolved
+ * or ambiguous target throws. Per-agent user overrides are supplied by the host as the spec, so they flow here too.
  */
 export function createModelResolver(options: ModelResolverOptions): (spec: ModelSpec, profile: SubagentProfile) => Promise<RegistryModel> {
 	return async (spec) => {
@@ -77,7 +80,11 @@ export function createModelResolver(options: ModelResolverOptions): (spec: Model
 		if (matches.length > 1) {
 			throw new Error(`Model selection for "${spec}" is ambiguous: ${matches.map((model) => `${model.provider}/${model.id}`).join(", ")}`);
 		}
-		if (spec === STRONG_REASONING_ALIAS && options.parentModel) return options.parentModel;
+		if (isModelAlias(spec)) {
+			const outcome = resolveAlias(spec as ModelAlias, { registry: options.registry, parentModel: options.parentModel });
+			if (outcome.model) return outcome.model;
+			throw new Error(`Model selection target "${spec}" is not available`);
+		}
 		throw new Error(`Model selection target "${spec}" is not available`);
 	};
 }

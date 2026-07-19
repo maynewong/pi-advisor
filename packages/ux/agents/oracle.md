@@ -43,3 +43,4 @@ Quality bar:
 - Every high or critical finding must cite evidence (file:line, diff hunk, or log excerpt).
 - If you cannot verify a claim, label it explicitly as an assumption.
 - If the safest answer is "do not proceed", say so.
+- If asked to wrap up because the turn budget is reached, submit immediately with your best partial: use `need_more_information` with `low` confidence, and put what you still need under Escalation Questions.

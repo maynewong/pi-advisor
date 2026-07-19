@@ -6,7 +6,7 @@
  * milestones/activity while running and a full markdown report when done.
  */
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -27,10 +27,20 @@ import {
 } from "pi-subagent-core";
 import {
 	builtInAgentNames,
+	buildRoutingTable,
 	createModelResolver,
+	DEFAULT_MODE,
+	isModelAlias,
 	loadBuiltInAgent,
+	MODE_ROUTING_TABLE,
 	oracleReportSchema,
+	PARENT_MODE_ENTRY,
+	resolveAlias,
+	sameModel,
+	SUBAGENT_MODES,
 	type BuiltInAgentName,
+	type ResolvedRoleRouting,
+	type SubagentMode,
 } from "../src/index.ts";
 
 // Shared parameter fragments so the generic tool and the per-role tools describe identical fields identically.
@@ -190,6 +200,7 @@ const TERMINAL_STATUSES = new Set<SubagentStatus>(["completed", "failed", "abort
 
 export interface SubagentUserConfig {
 	agents: Record<string, { model?: string }>;
+	mode?: SubagentMode;
 	oracleGuidance?: boolean;
 	artifactsDir?: string;
 	retentionDays?: number;
@@ -245,6 +256,12 @@ export async function loadSubagentConfig(agentDir = getAgentDir()): Promise<Suba
 		}
 		config.agents = agents as SubagentUserConfig["agents"];
 	}
+	if (root.mode !== undefined) {
+		if (typeof root.mode !== "string" || !(SUBAGENT_MODES as readonly string[]).includes(root.mode)) {
+			throw new Error(`Invalid ${path}: mode must be one of ${SUBAGENT_MODES.join(", ")}`);
+		}
+		config.mode = root.mode as SubagentMode;
+	}
 	if (root.oracleGuidance !== undefined) {
 		if (typeof root.oracleGuidance !== "boolean") throw new Error(`Invalid ${path}: oracleGuidance must be a boolean`);
 		config.oracleGuidance = root.oracleGuidance;
@@ -258,6 +275,21 @@ export async function loadSubagentConfig(agentDir = getAgentDir()): Promise<Suba
 	if (root.retentionDays !== undefined) config.retentionDays = root.retentionDays as number;
 	if (root.maxRuns !== undefined) config.maxRuns = root.maxRuns as number;
 	return config;
+}
+
+/** Persist the effort mode into subagent-kit.json, preserving all other fields and their values. */
+export async function persistMode(mode: SubagentMode, agentDir = getAgentDir()): Promise<void> {
+	const path = join(agentDir, MODEL_CONFIG_FILE);
+	let root: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(await readFile(path, "utf8"));
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) root = parsed as Record<string, unknown>;
+	} catch (error) {
+		if (!isMissingFile(error)) throw error;
+	}
+	root.mode = mode;
+	await mkdir(agentDir, { recursive: true });
+	await writeFile(path, `${JSON.stringify(root, null, 2)}\n`, "utf8");
 }
 
 /** Append the parent-facing consultation policy once per assembled prompt. */
@@ -296,6 +328,36 @@ export function contextForSubagent(
 	};
 }
 
+/** Render one resolved routing row for `/mode`, flagging degraded rows with an explanation. */
+export function formatRoutingRow(row: ResolvedRoleRouting): string {
+	const budget = row.maxTurns !== undefined ? ` · ≤${row.maxTurns} turns` : "";
+	const source = row.manualModel ? " (manual override)" : "";
+	const base = `${row.role} → ${row.modelId} · thinking ${row.thinkingLevel}${budget}${source}`;
+	return row.degraded ? `${base} ⚠ ${row.degradedReason ?? row.reason}` : base;
+}
+
+/**
+ * Apply the parent-session half of a mode switch. The Pi extension API exposes `setModel`/`setThinkingLevel`,
+ * so `/mode` retunes the parent orchestrator too. Returns a one-line report of what changed.
+ */
+async function applyParentMode(
+	pi: Pick<ExtensionAPI, "setModel" | "setThinkingLevel">,
+	mode: SubagentMode,
+	ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
+): Promise<string> {
+	const entry = PARENT_MODE_ENTRY[mode];
+	pi.setThinkingLevel(entry.thinkingLevel);
+	const outcome = resolveAlias(entry.model, { registry: ctx.modelRegistry, parentModel: ctx.model });
+	const target = outcome.model;
+	if (target && (!ctx.model || !sameModel(target, ctx.model))) {
+		const ok = await pi.setModel(target);
+		return ok
+			? `parent → ${outcome.modelId} · thinking ${entry.thinkingLevel}`
+			: `parent → thinking ${entry.thinkingLevel} (model switch to ${outcome.modelId} unavailable: no API key)`;
+	}
+	return `parent → ${outcome.modelId ?? ctx.model?.id ?? "unchanged"} · thinking ${entry.thinkingLevel} (model unchanged)`;
+}
+
 /** Resolve the per-project artifacts bucket, honoring an explicit override relative to cwd. */
 export function resolveArtifactsDir(cwd: string, override?: string): string {
 	if (override) return isAbsolute(override) ? override : resolve(cwd, override);
@@ -326,6 +388,8 @@ interface RunDetails {
 	agent: string;
 	task: string;
 	model?: string;
+	/** One-line note when this run's model was resolved via a degraded alias fallback. */
+	degradedNote?: string;
 	status: SubagentStatus;
 	usage: UsageSnapshot;
 	/** Major-progress notes surfaced by the subagent (and blocked-permission notices). */
@@ -339,9 +403,14 @@ interface RunDetails {
 	artifactsDir?: string;
 	verdict?: string;
 	confidence?: string;
+	/** Set when the run landed on its soft turn budget; its answer is a partial the parent can extend. */
+	stoppedBy?: SubagentResult["stoppedBy"];
 	error?: string;
 	finalText?: string;
 }
+
+/** One-line note shown when a run landed on its soft turn budget, so the parent knows it can extend it. */
+export const TURN_BUDGET_NOTE = "⏳ turn budget reached — partial answer; extend with subagent_send";
 
 interface TrackedRun {
 	handle: SubagentHandle;
@@ -397,7 +466,14 @@ function activityLine(event: SubagentEvent): string | undefined {
 }
 
 function resolveModel(profile: SubagentProfile, usage: UsageSnapshot, ctx: ExtensionContext): string | undefined {
-	if (profile.model) return typeof profile.model === "string" ? profile.model : profile.model.id;
+	if (profile.model) {
+		if (typeof profile.model !== "string") return profile.model.id;
+		// Resolve routing aliases to the concrete model id so the display matches the /mode table.
+		if (isModelAlias(profile.model)) {
+			return resolveAlias(profile.model, { registry: ctx.modelRegistry, parentModel: ctx.model }).modelId ?? profile.model;
+		}
+		return profile.model;
+	}
 	if (usage.model) return usage.model;
 	return ctx.model?.id;
 }
@@ -479,6 +555,7 @@ function renderOverview(ctx: ExtensionContext): void {
 function applyResult(details: RunDetails, result: SubagentResult): void {
 	details.status = result.status;
 	details.usage = result.usage;
+	details.stoppedBy = result.stoppedBy;
 	details.artifactsDir = result.artifacts?.dir;
 	const read = capDisclosure(result.disclosure.filesRead, result.artifacts?.dir);
 	const modified = capDisclosure(result.disclosure.filesModified, result.artifacts?.dir);
@@ -500,7 +577,7 @@ function applyResult(details: RunDetails, result: SubagentResult): void {
 }
 
 /** Build the completed-run summary text shared by the foreground path and subagent_result. */
-function completedSummary(profileName: string, result: SubagentResult, details: RunDetails): string {
+export function completedSummary(profileName: string, result: SubagentResult, details: RunDetails): string {
 	const readLine = details.filesRead.length
 		? `read: ${details.filesRead.join(", ")}${details.filesReadMore ? ` ${details.filesReadMore}` : ""}`
 		: "";
@@ -509,6 +586,8 @@ function completedSummary(profileName: string, result: SubagentResult, details: 
 		: "";
 	return [
 		`agent: ${profileName} · status: ${result.status} · turns: ${result.usage.turns} · cost: $${result.usage.cost.toFixed(4)}`,
+		result.stoppedBy === "turn_budget" ? TURN_BUDGET_NOTE : "",
+		details.degradedNote ?? "",
 		readLine,
 		modifiedLine,
 		result.error ? `error(${result.error.kind}): ${result.error.message}` : "",
@@ -554,6 +633,7 @@ function renderRunResult(
 		if (usageStr) line += ` ${theme.fg("dim", usageStr)}`;
 		if (details.verdict) line += ` ${theme.fg(details.verdict === "blocked" ? "error" : "accent", details.verdict)}`;
 		if (details.confidence) line += ` ${theme.fg("dim", `confidence:${details.confidence}`)}`;
+		if (details.stoppedBy === "turn_budget") line += `\n${theme.fg("muted", TURN_BUDGET_NOTE)}`;
 		return line;
 	};
 
@@ -757,9 +837,26 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			sessionFile ? { sessionFile, ...(leafId ? { entryId: leafId } : {}) } : undefined,
 		);
 
+		// Mode routing: a role's mode entry sets its model alias, thinking level, and turn budget.
+		// A manual `agents.<role>.model` override beats the table's alias; explicit per-run maxTurns beats it too.
 		const overrides: Partial<SubagentProfile> = {};
 		const configuredModel = config.agents[profile.name]?.model;
-		if (configuredModel) overrides.model = configuredModel;
+		const mode = config.mode ?? DEFAULT_MODE;
+		const modeEntry = MODE_ROUTING_TABLE[profile.name]?.[mode];
+		let degradedNote: string | undefined;
+		if (modeEntry) {
+			overrides.model = configuredModel ?? modeEntry.model;
+			overrides.thinkingLevel = modeEntry.thinkingLevel;
+			if (modeEntry.maxTurns !== undefined) overrides.maxTurns = modeEntry.maxTurns;
+			if (!configuredModel) {
+				const outcome = resolveAlias(modeEntry.model, { registry: ctx.modelRegistry, parentModel: ctx.model });
+				if (outcome.degraded) {
+					degradedNote = `⚠ ${profile.name} → ${outcome.modelId ?? "parent model"} · ${outcome.degradedReason ?? outcome.reason}`;
+				}
+			}
+		} else if (configuredModel) {
+			overrides.model = configuredModel;
+		}
 		if (forkRequested) overrides.contextMode = "fork";
 		if (params.writeScope?.length) {
 			overrides.permission = {
@@ -777,6 +874,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		};
 
 		const tracked = startRun(ctx, profile, params.task, spawnOptions, artifactsDir, manager, onUpdate, background);
+		if (degradedNote) {
+			tracked.details.degradedNote = degradedNote;
+			tracked.details.milestones.push(degradedNote);
+		}
 
 		if (background) {
 			const text = [
@@ -868,6 +969,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			"Send a follow-up message to an existing subagent run in this session. " +
 			"If the run is still running it is redirected mid-flight (steered) and this returns immediately; the run's own result surfaces via its original call or subagent_result. " +
 			"If the run has completed, its conversation continues with a new turn on the retained session, and (unless wait: false) this blocks and returns the new result. " +
+			"Use this to extend a run that landed on its soft turn budget (status completed, note \"turn budget reached\"): the resumed leg gets a fresh budget to finish the work. " +
 			"Runs that ended as failed, aborted, or timed out cannot be continued.",
 		parameters: sendParameters,
 		async execute(_toolCallId, params) {
@@ -936,6 +1038,38 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						);
 					})
 				: ["No subagent runs yet."];
+			if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("mode", {
+		description: "Show or switch the subagent effort mode (low|medium) and print the resolved routing table",
+		handler: async (args, ctx) => {
+			const arg = args.trim().toLowerCase();
+			if (arg && !(SUBAGENT_MODES as readonly string[]).includes(arg)) {
+				if (ctx.hasUI) ctx.ui.notify(`Usage: /mode [${SUBAGENT_MODES.join("|")}]`, "error");
+				return;
+			}
+			let config = await loadSubagentConfig();
+			let parentNote: string | undefined;
+			if (arg === "low" || arg === "medium") {
+				await persistMode(arg);
+				config = { ...config, mode: arg };
+				parentNote = await applyParentMode(pi, arg, ctx);
+			}
+			const mode = config.mode ?? DEFAULT_MODE;
+			const rows = buildRoutingTable(mode, {
+				registry: ctx.modelRegistry,
+				parentModel: ctx.model,
+				manualOverrides: config.agents,
+			});
+			const lines = [
+				`Subagent mode: ${mode}${config.mode ? "" : " (default)"}`,
+				...rows.map(formatRoutingRow),
+				...(parentNote ? [parentNote] : []),
+				"",
+				"/mode retunes the parent session's model & thinking level too. Per-role escape hatch: agents.<role>.model in subagent-kit.json.",
+			];
 			if (ctx.hasUI) ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});

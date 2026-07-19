@@ -135,7 +135,7 @@ export class SubagentManager {
 			? this.baseResult(run, outcome.error.kind === "aborted" ? "aborted" : "failed", outcome.text, outcome.error, disclosure, outcome.usage, undefined, outcome.sessionFile)
 			: (() => {
 				const resolved = resolveOutput(run.profile.output, outcome.text, outcome.submitted);
-				return this.baseResult(run, resolved.error ? "failed" : "completed", outcome.text, resolved.error, disclosure, outcome.usage, resolved.output, outcome.sessionFile);
+				return this.baseResult(run, resolved.error ? "failed" : "completed", outcome.text, resolved.error, disclosure, outcome.usage, resolved.output, outcome.sessionFile, outcome.stoppedBy);
 			})();
 		const event: DriverEvent = result.error ? { type: "failed", error: result.error.message } : { type: "completed" };
 		handle.emit(event);
@@ -260,6 +260,7 @@ export class SubagentManager {
 				outcome.usage,
 				resolved.output,
 				outcome.sessionFile,
+				outcome.stoppedBy,
 			);
 			emit(resolved.error ? { type: "failed", error: resolved.error.message } : { type: "completed" });
 			await this.finish(run, result, writer, transcript, workspace, { driver, disclosure });
@@ -283,8 +284,9 @@ export class SubagentManager {
 		usage = EMPTY_USAGE,
 		output?: unknown,
 		sessionFile?: string,
+		stoppedBy?: SubagentResult["stoppedBy"],
 	): SubagentResult {
-		return { status, text, usage: { ...usage }, disclosure, ...(error ? { error } : {}), ...(output !== undefined ? { output } : {}), ...(sessionFile ? { sessionRef: { file: sessionFile } } : {}) };
+		return { status, text, usage: { ...usage }, disclosure, ...(error ? { error } : {}), ...(stoppedBy ? { stoppedBy } : {}), ...(output !== undefined ? { output } : {}), ...(sessionFile ? { sessionRef: { file: sessionFile } } : {}) };
 	}
 
 	private async finish(

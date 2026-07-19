@@ -121,6 +121,30 @@ describe("resuming a completed run", () => {
 		expect(events.filter((event) => event.type === "file_read").map((event) => event.path)).toEqual(["a.ts", "b.ts"]);
 	});
 
+	test("extends a soft-budget landing via resume, and the resumed leg gets a fresh budget", async () => {
+		const factory: RuntimeDriverFactory = async (_request, emit) => ({
+			async run() {
+				emit({ type: "file_read", path: "a.ts" });
+				// The initial leg landed on its soft budget after a wrap-up turn.
+				return { text: "partial answer", stoppedBy: "turn_budget", usage: usage(9) };
+			},
+			async resume(message: string) {
+				// The resumed leg finished freely within a fresh budget: no stoppedBy flag.
+				return { text: `finished: ${message}`, usage: usage(3) };
+			},
+			async abort() {},
+		});
+		const manager = new SubagentManager({ cwd: "/repo", createDriver: factory });
+		const handle = manager.spawn({ ...PROFILE, maxTurns: 8 }, "task");
+		const landed = await handle.wait();
+		expect(landed).toMatchObject({ status: "completed", stoppedBy: "turn_budget" });
+
+		const extended = await handle.resume("keep going");
+		expect(extended).toMatchObject({ status: "completed", text: "finished: keep going" });
+		expect(extended.stoppedBy).toBeUndefined();
+		expect(handle.status).toBe("completed");
+	});
+
 	test("surfaces a resumed-turn failure as data and closes the conversation", async () => {
 		const factory: RuntimeDriverFactory = async () => ({
 			async run() { return { text: "ok", usage: usage(1) }; },

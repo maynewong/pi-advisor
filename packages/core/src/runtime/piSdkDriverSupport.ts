@@ -5,9 +5,49 @@
  */
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { SubagentEvent, SubagentProfile, SubagentResult } from "../types.ts";
+import type { OutputContract, SubagentEvent, SubagentProfile, SubagentResult } from "../types.ts";
 
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
+
+/**
+ * Soft turn budget ("soft landing"). Reaching the profile's `maxTurns` no longer kills the run;
+ * instead the child is asked to wrap up and land its best answer in one more turn. Deterministic code
+ * still keeps a runaway backstop: an absolute ceiling at HARD_CEILING_MULTIPLIER × the soft budget,
+ * at which the old hard-kill `max_turns` failure semantics still apply. Normal work never hits it.
+ */
+export const HARD_CEILING_MULTIPLIER = 3;
+
+/** The absolute turn ceiling for a soft budget: HARD_CEILING_MULTIPLIER × the budget, rounded up. */
+export function hardTurnCeiling(maxTurns: number): number {
+	return Math.ceil(maxTurns * HARD_CEILING_MULTIPLIER);
+}
+
+/** Base wrap-up instruction injected into the child when it reaches its soft turn budget. */
+export const WRAP_UP_INSTRUCTION =
+	"Turn budget reached. Stop investigating now and submit your best answer from what you have found so far. Mark anything unverified as an assumption.";
+
+/** The wrap-up instruction, extended for schema profiles so the child lands via the output tool. */
+export function wrapUpInstruction(output: OutputContract | undefined): string {
+	if (output?.kind === "schema") {
+		return `${WRAP_UP_INSTRUCTION} Call ${output.toolName ?? "submit_result"} now with your best structured result; use a low/uncertain confidence and record the open questions rather than continuing to investigate.`;
+	}
+	return WRAP_UP_INSTRUCTION;
+}
+
+export type TurnBudgetAction = "continue" | "wrap_up" | "hard_stop";
+
+/**
+ * Decide what to do at the start of a turn given the current per-leg turn count.
+ * - Under the soft budget: `continue`.
+ * - First turn past the soft budget: `wrap_up` (inject the wrap-up instruction, once).
+ * - Past the hard ceiling: `hard_stop` (runaway backstop, terminates as `max_turns`).
+ */
+export function turnBudgetAction(legTurns: number, maxTurns: number | undefined, wrapUpInjected: boolean): TurnBudgetAction {
+	if (!maxTurns) return "continue";
+	if (legTurns > hardTurnCeiling(maxTurns)) return "hard_stop";
+	if (legTurns > maxTurns && !wrapUpInjected) return "wrap_up";
+	return "continue";
+}
 
 export function driverErrorFromMessages(messages: AgentMessage[]): SubagentResult["error"] | undefined {
 	for (let index = messages.length - 1; index >= 0; index--) {

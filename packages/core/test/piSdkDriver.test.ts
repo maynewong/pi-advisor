@@ -4,9 +4,13 @@ import {
 	assertOracleReadOnly,
 	describeToolCall,
 	driverErrorFromMessages,
+	hardTurnCeiling,
 	resolveActiveTools,
 	successfulFileEvent,
 	thoughtPreview,
+	turnBudgetAction,
+	WRAP_UP_INSTRUCTION,
+	wrapUpInstruction,
 } from "../src/runtime/piSdkDriverSupport.ts";
 import type { SubagentProfile } from "../src/types.ts";
 
@@ -87,6 +91,32 @@ describe("piSdkDriver projections", () => {
 		expect(describeToolCall("read", {})).toBe("Reading file");
 		expect(describeToolCall("bash", { command: 42 })).toBe("Running: ");
 		expect(describeToolCall("grep", {})).toBe('Searching ""');
+	});
+
+	test("computes the hard turn ceiling as 3x the soft budget, rounded up", () => {
+		expect(hardTurnCeiling(8)).toBe(24);
+		expect(hardTurnCeiling(5)).toBe(15);
+		expect(hardTurnCeiling(1)).toBe(3);
+	});
+
+	test("decides the soft-budget action: continue, wrap up once, then hard stop", () => {
+		// No budget configured: always continue.
+		expect(turnBudgetAction(100, undefined, false)).toBe("continue");
+		// Within the soft budget.
+		expect(turnBudgetAction(8, 8, false)).toBe("continue");
+		// First turn past the soft budget injects the wrap-up (once).
+		expect(turnBudgetAction(9, 8, false)).toBe("wrap_up");
+		expect(turnBudgetAction(9, 8, true)).toBe("continue");
+		// Past the hard ceiling (3x) the runaway backstop hard-stops even after wrap-up.
+		expect(turnBudgetAction(25, 8, true)).toBe("hard_stop");
+	});
+
+	test("extends the wrap-up instruction for schema profiles to land via the output tool", () => {
+		expect(wrapUpInstruction(undefined)).toBe(WRAP_UP_INSTRUCTION);
+		expect(wrapUpInstruction({ kind: "text" })).toBe(WRAP_UP_INSTRUCTION);
+		const schema = wrapUpInstruction({ kind: "schema", schema: { type: "object" }, toolName: "submit_result" });
+		expect(schema).toContain(WRAP_UP_INSTRUCTION);
+		expect(schema).toMatch(/call submit_result/i);
 	});
 
 	test("condenses thinking or text blocks to a single short line", () => {
