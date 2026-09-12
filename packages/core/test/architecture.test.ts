@@ -24,6 +24,6 @@ describe("core dependency direction", () => {
 		const manifest = JSON.parse(await readFile(join(import.meta.dirname, "../package.json"), "utf8")) as {
 			dependencies?: Record<string, string>;
 		};
-		expect(manifest.dependencies).not.toHaveProperty("pi-advisor-ux");
+		expect(manifest.dependencies).not.toHaveProperty("@maynewong/pi-advisor");
 	});
 });

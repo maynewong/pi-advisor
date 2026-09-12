@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createHerdrCliAdapter } from "./adapter.ts";
 import { loadHerdrAdvisorConfig } from "./config.ts";
 import { createHerdrAdvisorProvider, exampleHerdrTargets } from "./provider.ts";
-import { registerRuntimeProvider } from "pi-advisor-core";
+import { registerRuntimeProvider } from "@maynewong/pi-advisor-core";
 
 /** Registers the Grok/Codex local-pane adapter. Load with `pi -e <this file>` from a Herdr-hosted Pi pane. */
 export default function herdrAdvisorExample(pi: ExtensionAPI): void {

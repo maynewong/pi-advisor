@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { builtInAgentNames, createModelResolver, getBuiltInAgentPath, loadBuiltInAgent, advisorReportSchema } from "../src/index.ts";
-import { buildContextPacket } from "pi-advisor-core";
+import { buildContextPacket } from "@maynewong/pi-advisor-core";
 import subagentExtension, {
 	appendAdvisorGuidance,
 	completedSummary,
@@ -20,8 +20,8 @@ import subagentExtension, {
 	roleToolSpecs,
 	TURN_BUDGET_NOTE,
 } from "../extensions/subagent.ts";
-import type { SubagentResult } from "pi-advisor-core";
-import type { SubagentProfile } from "pi-advisor-core";
+import type { SubagentResult } from "@maynewong/pi-advisor-core";
+import type { SubagentProfile } from "@maynewong/pi-advisor-core";
 
 const anyProfile = { name: "any" } as SubagentProfile;
 

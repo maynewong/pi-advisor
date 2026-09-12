@@ -5,7 +5,7 @@
  * unit-testable without a real terminal or theme.
  */
 import { matchesKey } from "@earendil-works/pi-tui";
-import type { SubagentStatus } from "pi-advisor-core";
+import type { SubagentStatus } from "@maynewong/pi-advisor-core";
 import {
 	compactActivity,
 	displayAgentName,

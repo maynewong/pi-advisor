@@ -39,7 +39,7 @@ import {
 	type SubagentTranscriptItem,
 	type SubagentTranscriptMessage,
 	type UsageSnapshot,
-} from "pi-advisor-core";
+} from "@maynewong/pi-advisor-core";
 import {
 	builtInAgentNames,
 	buildRoutingTable,

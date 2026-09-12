@@ -11,7 +11,7 @@ Minimal working example for running Pi Advisor through a separate Herdr pane. Tw
 
 Every Advisor run creates a fresh randomly named pane (`grok-advisor-<hex>` or `codex-advisor-<hex>`), so unrelated runs never share conversation history. `resume()` stays on the pane owned by that run. When Main selected a Context Packet, the provider stores that already-bounded packet in a mode-`0600` temporary file and sends only its path and source summary. The Advisor reads it on demand when the task needs diff, scoped-file, or inherited-conversation evidence.
 
-There is no Agent Skill, local bridge model, or prompt transcript scraping. Copy the five TypeScript files below into a trusted Pi package; the JSON file is a configuration example. Install `pi-advisor-core` as a dependency and load the Pi Advisor main extension as well. The `herdr` CLI and the selected agent CLI (`codex` or Grok) must be on `PATH`.
+There is no Agent Skill, local bridge model, or prompt transcript scraping. Copy the five TypeScript files below into a trusted Pi package; the JSON file is a configuration example. Install `@maynewong/pi-advisor-core` as a dependency and load the Pi Advisor main extension as well. The `herdr` CLI and the selected agent CLI (`codex` or Grok) must be on `PATH`.
 
 | File | Role |
 | --- | --- |

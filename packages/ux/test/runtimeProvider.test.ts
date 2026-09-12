@@ -9,7 +9,7 @@ import {
 	type DriverRequest,
 	type RuntimeDriverProvider,
 	type RuntimeSelection,
-} from "pi-advisor-core";
+} from "@maynewong/pi-advisor-core";
 import subagentExtension from "../extensions/subagent.ts";
 
 function model(id: string) {

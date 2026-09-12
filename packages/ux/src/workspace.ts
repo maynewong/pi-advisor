@@ -10,7 +10,7 @@ import {
 	type EditorComponent,
 	type OverlayHandle,
 } from "@earendil-works/pi-tui";
-import type { SubagentStatus, SubagentTranscriptItem, SubagentTranscriptMessage, UsageSnapshot } from "pi-advisor-core";
+import type { SubagentStatus, SubagentTranscriptItem, SubagentTranscriptMessage, UsageSnapshot } from "@maynewong/pi-advisor-core";
 import {
 	compactActivity,
 	displayAgentLabel,

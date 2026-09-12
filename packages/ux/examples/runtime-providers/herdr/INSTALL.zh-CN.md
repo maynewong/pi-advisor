@@ -111,12 +111,12 @@ my-pi-plugin/
     "extensions": ["./runtime/herdr/extension.ts"]
   },
   "dependencies": {
-    "pi-advisor-core": "file:/absolute/path/to/pi-advisor/packages/core"
+    "@maynewong/pi-advisor-core": "file:/absolute/path/to/pi-advisor/packages/core"
   }
 }
 ```
 
-保留你已有的扩展入口及依赖。此处使用本地依赖，不假设 `pi-advisor-core` 已发布到 npm；分发插件时应换成实际可安装且与主插件兼容的 core 版本。
+保留你已有的扩展入口及依赖。此处使用本地依赖，不假设 `@maynewong/pi-advisor-core` 已发布到 npm；分发插件时应换成实际可安装且与主插件兼容的 core 版本。
 
 在自己的插件目录安装依赖，再注册本地包：
 

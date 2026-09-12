@@ -1,7 +1,8 @@
 {
-	"name": "pi-advisor-ux",
+	"name": "@maynewong/pi-advisor",
 	"version": "0.1.0",
-	"description": "Pi Advisor extension: Advisor tool, dashboard, workspace, and routing controls.",
+	"license": "MIT",
+	"description": "A second opinion for your Pi coding agent.",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/maynewong/pi-advisor.git",
@@ -22,12 +23,19 @@
 	"pi": {
 		"extensions": ["./extensions"]
 	},
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
 	"files": [
-		"src",
-		"extensions",
-		"agents",
-		"examples",
+		"src/**/*.ts",
+		"extensions/**/*.ts",
+		"agents/*.md",
+		"examples/**/*.ts",
+		"examples/**/*.json",
+		"examples/**/*.md",
 		"README.md",
+		"LICENSE",
 		"default-routing.json",
 		"pi-advisor.example.json",
 		"pi-advisor.profiles.example.json"
@@ -37,7 +45,7 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"pi-advisor-core": "^0.1.0"
+		"@maynewong/pi-advisor-core": "0.1.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",

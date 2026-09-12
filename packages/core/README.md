@@ -1,4 +1,4 @@
-# pi-advisor-core
+# @maynewong/pi-advisor-core
 
 A headless runtime for isolated Pi Advisor reviews. It provides manager and handle APIs for host-side orchestration.
 
@@ -24,7 +24,7 @@ workflow adapters, remote execution transports, and cross-host background recove
 ## Usage
 
 ```ts
-import { SubagentManager } from "pi-advisor-core";
+import { SubagentManager } from "@maynewong/pi-advisor-core";
 
 const manager = new SubagentManager({
   cwd: "/absolute/project/path",
@@ -77,7 +77,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   registerRuntimeProvider,
   type RuntimeDriverProvider,
-} from "pi-advisor-core";
+} from "@maynewong/pi-advisor-core";
 
 const provider: RuntimeDriverProvider = {
   id: "example-runtime",

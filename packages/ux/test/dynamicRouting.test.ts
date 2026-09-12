@@ -6,8 +6,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const managerState = vi.hoisted(() => ({ resolvedModels: [] as unknown[], nextId: 0 }));
 
-vi.mock("pi-advisor-core", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("pi-advisor-core")>();
+vi.mock("@maynewong/pi-advisor-core", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("@maynewong/pi-advisor-core")>();
 	class TestSubagentManager {
 		constructor(private readonly options: { resolveModel: (spec: unknown, profile: unknown) => Promise<unknown> }) {}
 

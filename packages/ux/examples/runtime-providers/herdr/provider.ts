@@ -9,7 +9,7 @@ import {
 	type RuntimeDriverProvider,
 	type RuntimeProviderHost,
 	type RuntimeSelection,
-} from "pi-advisor-core";
+} from "@maynewong/pi-advisor-core";
 
 export type HerdrAdvisorTargetId = string;
 export type CodexReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "persistent";

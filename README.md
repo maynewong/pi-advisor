@@ -21,7 +21,7 @@ Start with one model you already have. Reviews add model usage and do not replac
 You need Node.js **22.19.0+**, Git, and [Pi with an authenticated model](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#quick-start).
 
 ```bash
-pi install git:github.com/maynewong/pi-advisor
+pi install npm:@maynewong/pi-advisor
 ```
 
 Only install extensions you trust: they execute code on your machine.
@@ -140,13 +140,13 @@ Keep `parentModel` and `agents.search`. Remove Advisor's old `model` and `thinki
 
 ### 4. Load the provider
 
-With Pi Advisor already installed, run this from your project directory inside Herdr. The path below assumes the quick-start Git install:
+With Pi Advisor already installed, run this from your project directory inside Herdr. The path below assumes the quick-start npm install:
 
 ```bash
-pi -e "$HOME/.pi/agent/git/github.com/maynewong/pi-advisor/packages/ux/examples/runtime-providers/herdr/extension.ts"
+pi -e "$HOME/.pi/agent/npm/node_modules/@maynewong/pi-advisor/examples/runtime-providers/herdr/extension.ts"
 ```
 
-For a local checkout, substitute its absolute path. Main's automatic consultations now use Herdr. To test it explicitly:
+For a source checkout, use `/absolute/path/to/pi-advisor/packages/ux/examples/runtime-providers/herdr/extension.ts`. Main's automatic consultations now use Herdr. To test it explicitly:
 
 ```text
 /advisor Review the current diff for correctness and hidden risks.
@@ -178,3 +178,9 @@ npm install
 npm test
 npm run typecheck
 ```
+
+To check the publishable tarballs and test a clean installation, run `npm run release:check`. See the [release guide](docs/releasing.md) for npm publishing.
+
+## License
+
+[MIT](LICENSE).

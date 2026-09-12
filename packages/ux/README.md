@@ -1,9 +1,17 @@
-# pi-advisor-ux
+# Pi Advisor
+
+**A second opinion for your Pi coding agent.**
+
+```bash
+pi install npm:@maynewong/pi-advisor
+```
+
+Start with the [quick-start guide](https://github.com/maynewong/pi-advisor#quick-start). This page covers configuration, commands, and integration APIs.
 
 Pi Advisor's host-side dashboard and Advisor workspace integration. Built-in role cards are replaceable data and contain no runtime implementation.
 
 ```ts
-import { loadBuiltInAgent } from "pi-advisor-ux";
+import { loadBuiltInAgent } from "@maynewong/pi-advisor";
 
 const advisor = await loadBuiltInAgent("advisor");
 ```
@@ -253,4 +261,4 @@ Because the Pi extension API exposes `setModel`/`setThinkingLevel`, activating a
 
 - `/advisor <question>` asks Advisor for a second opinion and includes the current Git diff.
 - Prefer the dedicated `advisor` tool; it includes the working-tree diff by default. Use it both for plan review (`inheritConversation: true`) and for adversarial review of a finished change.
-- Advisor results expose `verdict`, `confidence`, and a full Markdown report for rendering and routing. The output contract is the shared `advisorReportSchema` exported from `pi-advisor-ux`.
+- Advisor results expose `verdict`, `confidence`, and a full Markdown report for rendering and routing. The output contract is the shared `advisorReportSchema` exported from `@maynewong/pi-advisor`.

@@ -5,7 +5,7 @@
 import { fileURLToPath } from "node:url";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
-import { loadProfileFile, type ModelSpec, type SubagentProfile } from "pi-advisor-core";
+import { loadProfileFile, type ModelSpec, type SubagentProfile } from "@maynewong/pi-advisor-core";
 
 export * from "./presentation.ts";
 export * from "./routing.ts";

@@ -1,5 +1,5 @@
-import type { SubagentStatus, SubagentTranscriptItem, SubagentTranscriptMessage } from "pi-advisor-core";
-import { upsertTranscriptItem } from "pi-advisor-core";
+import type { SubagentStatus, SubagentTranscriptItem, SubagentTranscriptMessage } from "@maynewong/pi-advisor-core";
+import { upsertTranscriptItem } from "@maynewong/pi-advisor-core";
 
 const TERMINAL_STATUSES = new Set<SubagentStatus>(["completed", "failed", "aborted", "timeout"]);
 

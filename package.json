@@ -2,7 +2,8 @@
 	"name": "pi-advisor",
 	"version": "0.1.0",
 	"private": true,
-	"description": "A dedicated Advisor for Pi: isolated review, risk analysis, and evidence-backed recommendations while Main stays in control.",
+	"license": "MIT",
+	"description": "A second opinion for your Pi coding agent.",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/maynewong/pi-advisor.git"
@@ -28,11 +29,17 @@
 	],
 	"scripts": {
 		"test": "npm run test --workspaces --if-present",
-		"typecheck": "npm run typecheck --workspaces --if-present"
+		"typecheck": "npm run typecheck --workspaces --if-present",
+		"test:package": "node scripts/test-package.mjs",
+		"release:check": "npm test && npm run typecheck && npm run test:package"
 	},
 	"devDependencies": {
+		"@earendil-works/pi-agent-core": "0.85.1",
+		"@earendil-works/pi-ai": "0.85.1",
+		"@earendil-works/pi-coding-agent": "0.85.1",
 		"@earendil-works/pi-tui": "^0.85.1",
 		"@types/node": "24.12.4",
+		"typebox": "1.1.38",
 		"typescript": "5.9.3",
 		"vitest": "4.1.9"
 	},

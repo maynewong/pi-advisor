@@ -6,7 +6,7 @@
  */
 import { createRequire } from "node:module";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import type { SubagentProfile } from "pi-advisor-core";
+import type { SubagentProfile } from "@maynewong/pi-advisor-core";
 
 /** Model shape as it comes off the authenticated registry (id, provider, cost, contextWindow, reasoning). */
 type RegistryModel = ReturnType<ModelRegistry["getAvailable"]>[number];

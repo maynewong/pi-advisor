@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createEventBus, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { registerRuntimeProvider, type DriverRequest, type RuntimeDriverProvider } from "pi-advisor-core";
+import { registerRuntimeProvider, type DriverRequest, type RuntimeDriverProvider } from "@maynewong/pi-advisor-core";
 import subagentExtension, {
 	KIT_TOOL_NAMES,
 	effectiveModeRoute,

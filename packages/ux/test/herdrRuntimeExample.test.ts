@@ -1,6 +1,6 @@
 import { access, readFile, stat } from "node:fs/promises";
 import { describe, expect, test, vi } from "vitest";
-import type { DriverRequest } from "pi-advisor-core";
+import type { DriverRequest } from "@maynewong/pi-advisor-core";
 import { createHerdrCliAdapter } from "../examples/runtime-providers/herdr/adapter.ts";
 import { herdrResult, herdrTextResult, type HerdrCli } from "../examples/runtime-providers/herdr/cli.ts";
 import { parseHerdrAdvisorConfig } from "../examples/runtime-providers/herdr/config.ts";
