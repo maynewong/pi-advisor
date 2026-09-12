@@ -1,0 +1,24 @@
+{
+  "modes": {
+    "low": {
+      "agent": { "model": "glm-5.3", "thinkingLevel": "medium" },
+      "advisor": { "model": "gpt-5.6-sol", "thinkingLevel": "high", "maxTurns": 16 },
+      "search": { "model": "gpt-5.6-terra", "thinkingLevel": "low", "maxTurns": 8 }
+    },
+    "medium": {
+      "agent": { "model": "gpt-5.6-sol", "thinkingLevel": "medium" },
+      "advisor": { "model": "gpt-5.6-sol", "thinkingLevel": "high", "maxTurns": 16 },
+      "search": { "model": "gpt-5.6-terra", "thinkingLevel": "low", "maxTurns": 12 }
+    },
+    "high": {
+      "agent": { "model": "gpt-5.6-sol", "thinkingLevel": "xhigh" },
+      "advisor": { "model": "gpt-5.6-sol", "thinkingLevel": "high", "maxTurns": 16 },
+      "search": { "model": "gpt-5.6-terra", "thinkingLevel": "low", "maxTurns": 16 }
+    },
+    "ultra": {
+      "agent": { "model": "gpt-5.6-sol", "thinkingLevel": "xhigh" },
+      "advisor": { "model": "gpt-5.6-sol", "thinkingLevel": "xhigh", "maxTurns": 24 },
+      "search": { "model": "gpt-5.6-terra", "thinkingLevel": "low", "maxTurns": 24 }
+    }
+  }
+}

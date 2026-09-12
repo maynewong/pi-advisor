@@ -1,0 +1,42 @@
+{
+	"name": "pi-advisor",
+	"version": "0.1.0",
+	"private": true,
+	"description": "A dedicated Advisor for Pi: isolated review, risk analysis, and evidence-backed recommendations while Main stays in control.",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/maynewong/pi-advisor.git"
+	},
+	"homepage": "https://github.com/maynewong/pi-advisor#readme",
+	"bugs": {
+		"url": "https://github.com/maynewong/pi-advisor/issues"
+	},
+	"keywords": [
+		"pi-package",
+		"pi-advisor",
+		"advisor",
+		"code-review",
+		"ai-assistant"
+	],
+	"pi": {
+		"extensions": [
+			"./packages/ux/extensions"
+		]
+	},
+	"workspaces": [
+		"packages/*"
+	],
+	"scripts": {
+		"test": "npm run test --workspaces --if-present",
+		"typecheck": "npm run typecheck --workspaces --if-present"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-tui": "^0.85.1",
+		"@types/node": "24.12.4",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

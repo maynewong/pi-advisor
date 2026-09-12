@@ -1,0 +1,50 @@
+{
+  "profile": "personal",
+  "mode": "medium",
+  "autoActivate": false,
+  "profiles": {
+    "personal": {
+      "parentModel": "personal-provider/main-model",
+      "agents": {
+        "advisor": {
+          "model": "personal-provider/reasoning-model",
+          "thinkingLevel": "high",
+          "maxTurns": 8
+        },
+        "search": {
+          "model": "personal-provider/fast-model",
+          "thinkingLevel": "low"
+        }
+      }
+    },
+    "company": {
+      "modes": {
+        "low": {
+          "agent": { "model": "company-provider/fast-model", "thinkingLevel": "medium" },
+          "advisor": { "model": "company-provider/reasoning-model", "thinkingLevel": "high" },
+          "search": { "model": "company-provider/fast-model", "thinkingLevel": "low", "maxTurns": 8 }
+        },
+        "medium": {
+          "agent": { "model": "company-provider/main-model", "thinkingLevel": "high" },
+          "advisor": { "model": "company-provider/reasoning-model", "thinkingLevel": "high" },
+          "search": { "model": "company-provider/fast-model", "thinkingLevel": "low", "maxTurns": 12 }
+        },
+        "high": {
+          "agent": { "model": "company-provider/main-model", "thinkingLevel": "xhigh" },
+          "advisor": { "model": "company-provider/reasoning-model", "thinkingLevel": "xhigh" },
+          "search": { "model": "company-provider/fast-model", "thinkingLevel": "low", "maxTurns": 16 }
+        },
+        "ultra": {
+          "agent": { "model": "company-provider/main-model", "thinkingLevel": "xhigh" },
+          "advisor": { "model": "company-provider/reasoning-model", "thinkingLevel": "xhigh", "maxTurns": 24 },
+          "search": { "model": "company-provider/fast-model", "thinkingLevel": "low", "maxTurns": 24 }
+        }
+      },
+      "agents": {
+        "advisor": { "maxTurns": 16, "finalizeTurns": 2 }
+      }
+    }
+  },
+  "retentionDays": 14,
+  "maxRuns": 200
+}

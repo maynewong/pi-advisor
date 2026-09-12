@@ -1,0 +1,29 @@
+{
+  "targets": {
+    "grok-4.6-low": {
+      "agent": "grok",
+      "model": "grok-4.6",
+      "reasoningEffort": "low"
+    },
+    "grok-4.6-high": {
+      "agent": "grok",
+      "model": "grok-4.6",
+      "reasoningEffort": "high"
+    },
+    "codex-astra-low": {
+      "agent": "codex",
+      "model": "gpt-6-astra",
+      "reasoningEffort": "low"
+    },
+    "codex-astra-high": {
+      "agent": "codex",
+      "model": "gpt-6-astra",
+      "reasoningEffort": "high"
+    },
+    "codex-astra-xhigh": {
+      "agent": "codex",
+      "model": "gpt-6-astra",
+      "reasoningEffort": "xhigh"
+    }
+  }
+}

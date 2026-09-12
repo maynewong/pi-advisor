@@ -1,0 +1,50 @@
+{
+	"name": "pi-advisor-ux",
+	"version": "0.1.0",
+	"description": "Pi Advisor extension: Advisor tool, dashboard, workspace, and routing controls.",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/maynewong/pi-advisor.git",
+		"directory": "packages/ux"
+	},
+	"homepage": "https://github.com/maynewong/pi-advisor/tree/main/packages/ux#readme",
+	"bugs": {
+		"url": "https://github.com/maynewong/pi-advisor/issues"
+	},
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": "./src/index.ts",
+		"./agents/*": "./agents/*.md",
+		"./examples/*": "./examples/*"
+	},
+	"keywords": ["pi-package", "pi-advisor", "advisor", "code-review", "ai-assistant"],
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"files": [
+		"src",
+		"extensions",
+		"agents",
+		"examples",
+		"README.md",
+		"default-routing.json",
+		"pi-advisor.example.json",
+		"pi-advisor.profiles.example.json"
+	],
+	"scripts": {
+		"test": "vitest --run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"pi-advisor-core": "^0.1.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

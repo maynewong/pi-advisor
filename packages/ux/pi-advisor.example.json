@@ -1,0 +1,27 @@
+{
+  "mode": "medium",
+  "autoActivate": false,
+  "modes": {
+    "low": {
+      "agent": { "model": "xai/grok-4.6", "thinkingLevel": "high" },
+      "advisor": { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high", "maxTurns": 16 },
+      "search": { "model": "openai-codex/gpt-5.6-terra", "thinkingLevel": "low", "maxTurns": 8 }
+    },
+    "medium": {
+      "agent": { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high" },
+      "advisor": { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "xhigh", "maxTurns": 16 },
+      "search": { "model": "openai-codex/gpt-5.6-terra", "thinkingLevel": "low", "maxTurns": 12 }
+    },
+    "high": {
+      "agent": { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "xhigh" },
+      "advisor": { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "high", "maxTurns": 16 },
+      "search": { "model": "openai-codex/gpt-5.6-terra", "thinkingLevel": "low", "maxTurns": 16 }
+    },
+    "ultra": {
+      "agent": { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "xhigh" },
+      "advisor": { "model": "openai-codex/gpt-5.6-sol", "thinkingLevel": "xhigh", "maxTurns": 24 },
+      "search": { "model": "openai-codex/gpt-5.6-terra", "thinkingLevel": "low", "maxTurns": 24 }
+    }
+  },
+  "agents": {}
+}
